@@ -342,6 +342,124 @@ def reply_comment(oid: str, root_id: str, parent_id: str, message: str, comment_
     return api_post_form('https://api.bilibili.com/x/v2/reply/add', data)
 
 
+def check_reply_audit(oid: str, rpid: str, comment_type) -> int:
+    """检查刚发送的评论是否被B站审核系统拦截。
+
+    通过 GET /x/v2/reply/reply 接口查询该评论的 state 字段:
+      - state=1: 正常可见
+      - state=17: 审核中/仅自己可见(被拦截)
+
+    Args:
+        oid: 内容的subject_id
+        rpid: 评论ID (reply/add 返回的 rpid)
+        comment_type: 评论区类型
+
+    Returns:
+        state 值 (1=可见, 17=被拦), 0=查询失败
+    """
+    try:
+        d = api_get(
+            f"https://api.bilibili.com/x/v2/reply/reply"
+            f"?type={comment_type}&oid={oid}&root={rpid}&pn=1&ps=1"
+        )
+        if d.get('code') == 0:
+            root = d.get('data', {}).get('root', {})
+            if root:
+                return root.get('state', 0)
+    except Exception as e:
+        print(f"    审核状态查询异常: {e}")
+    return 0
+
+
+def send_reply_with_audit_check(oid: str, root_id: str, parent_id: str,
+                                 message: str, comment_type,
+                                 notify_callback=None) -> tuple:
+    """发送评论回复,并在发送后检查是否被审核拦截。
+
+    流程:
+      1. 调用 reply_comment 发送回复
+      2. 检查返回值中的 state 字段(立即判断)
+      3. 如果 state=1, 等45秒后再查一次(确认未被延迟拦截)
+      4. 如果被拦截(state=17), 发送一条抱歉通知
+
+    Args:
+        oid, root_id, parent_id, message, comment_type: 同 reply_comment
+        notify_callback: QQ通知回调
+
+    Returns:
+        (success: bool, resp: dict) 元组
+    """
+    # 1. 发送回复
+    resp = reply_comment(oid, root_id, parent_id, message, comment_type)
+
+    if resp.get('code') != 0:
+        return False, resp
+
+    # 2. 从返回值中获取 rpid 和 state
+    reply_data = resp.get('data', {})
+    rpid = str(reply_data.get('rpid', ''))
+    immediate_state = reply_data.get('state', 0)
+    print(f"  ✅ 回复发送成功 (rpid={rpid}, state={immediate_state})")
+
+    # 3. 如果立即就知道被拦了
+    if immediate_state == 17:
+        print(f"  ⚠️  回复被审核拦截(仅自己可见),发送抱歉通知")
+        _send_audit_fail_notice(oid, root_id, rpid, comment_type, notify_callback)
+        return True, resp  # 发送本身是成功的,只是被审核拦了
+
+    # 4. state=1 或未知 → 等45秒后再确认(防止延迟审核)
+    if rpid:
+        # 启动异步检查(不阻塞主循环)
+        _schedule_audit_check(oid, rpid, comment_type, notify_callback, delay=45)
+
+    return True, resp
+
+
+def _send_audit_fail_notice(oid: str, root_id: str, parent_id: str,
+                             comment_type, notify_callback=None):
+    """发送审核被拦的抱歉通知。"""
+    notice = "抱歉，刚才的回复似乎被B站审核系统拦截了（仅自己可见），正在排查原因。"
+    try:
+        resp = reply_comment(oid, root_id, parent_id, notice, comment_type)
+        if resp.get('code') == 0:
+            print(f"  📢 已发送审核拦截通知")
+        else:
+            print(f"  ⚠️  审核拦截通知发送失败: {resp.get('message', '')}")
+    except Exception as e:
+        print(f"  ⚠️  审核拦截通知异常: {e}")
+
+
+def _schedule_audit_check(oid: str, rpid: str, comment_type,
+                           notify_callback, delay: int = 45):
+    """延迟检查审核状态(不阻塞主循环)。
+
+    使用简单的 threading.Timer 在后台等待后检查。
+    """
+    import threading
+
+    def _check():
+        try:
+            state = check_reply_audit(oid, rpid, comment_type)
+            if state == 17:
+                print(f"  ⚠️  延迟审核拦截: rpid={rpid} (发送{delay}秒后被标记为仅自己可见)")
+                # 查找该评论的 root 和 parent 来发通知
+                # 由于我们没有保存 root_id, 这里用 rpid 作为 root
+                _send_audit_fail_notice(oid, rpid, rpid, comment_type, notify_callback)
+                if notify_callback:
+                    notify_callback("⚠️ B站回复被审核拦截(延迟)\n已发送抱歉通知")
+            elif state == 1:
+                print(f"  ✅ 审核确认通过: rpid={rpid}")
+            else:
+                print(f"  ℹ️  审核状态未知: rpid={rpid}, state={state}")
+        except Exception as e:
+            print(f"  ⚠️  延迟审核检查异常: {e}")
+
+    timer = threading.Timer(delay, _check)
+    timer.daemon = True  # 主进程退出时自动结束
+    timer.start()
+    print(f"  ⏱️  已安排{delay}秒后审核状态检查")
+
+
 # ============================================================================
 # B站 API: 获取评论下的所有回复(子评论)
 # ============================================================================
@@ -733,7 +851,7 @@ def generate_chat_reply(
         system_text += "\n\n注意:你没有看过相关视频,不要假装了解视频内容。"
     if visual_context:
         system_text += f"\n\n你刚刚重新仔细查看了视频画面,以下是你看到的:\n{visual_context[:1000]}\n请根据画面内容给出准确回答。"
-    system_text += "\n\n要求:回复简洁自然,不要过度客套。可以用适度的幽默感。如果有上下文(之前对话过),要带入上下文。回复严格控制在150字以内。\n\n重要:不要在回复中加@用户名。B站评论区会自动把你的回复放在对应评论下方,不需要你手动@对方。绝对不要输出任何'@xxx'格式的内容。"
+    system_text += "\n\n要求:回复简洁自然,不要过度客套。可以用适度的幽默感。如果有上下文(之前对话过),要带入上下文。回复控制在300字以内,把内容说完整。\n\n重要:不要在回复中加@用户名。B站评论区会自动把你的回复放在对应评论下方,不需要你手动@对方。绝对不要输出任何'@xxx'格式的内容。"
 
     # GLM-5.1 Anthropic接口不支持system角色,改为放在第一条user消息前面
     messages = [
@@ -1224,7 +1342,7 @@ def final_summarize(visual_desc: str, asr_text: str, api_key: str) -> str:
 1. 语气轻松自然,偶尔可以带点调侃,但不要过度娱乐化或戏谑
 2. 把视频内容说清楚--讲了什么、展示了什么、核心话题是什么
 3. 如果语音识别文本不准,主要靠画面判断
-4. 严格控制在150字以内,写成一段连贯的文字,不要分点,不要换行
+4. 控制在300字以内,把内容说完整,写成一段连贯的文字,不要分点,不要换行
 5. 保持适度幽默感,但内容准确比花哨重要
 6. 重要:如果输入信息不足以判断视频真实内容,请回复"信息不足,无法准确总结"而不是编造内容"""
     for attempt in range(3):
@@ -1382,7 +1500,7 @@ def process_dynamic(uri: str, subject_id: str, root_id: str, title: str = '',
 要求:
 1. 语气轻松自然,偶尔可以带点调侃,但不要过度娱乐化
 2. 把动态内容说清楚--发了什么、核心话题是什么
-3. 严格控制在150字以内,写成一段连贯的文字,不要分点,不要换行"""
+3. 控制在300字以内,把内容说完整,写成一段连贯的文字,不要分点,不要换行"""
 
     summary = "__MODEL_UNAVAILABLE__"
     for attempt in range(3):
@@ -1585,11 +1703,10 @@ def handle_chat_message(item: dict, bv: str, comment_type: int,
         elif summary.startswith("视频下载失败"):
             reply_text = summary
             # 直接跳到发送回复
-            resp = reply_comment(subject_id, top_root_id, parent_id, reply_text, comment_type)
-            if resp.get('code') == 0:
-                print(f"  ✅ 回复成功!")
+            success, resp = send_reply_with_audit_check(subject_id, top_root_id, parent_id, reply_text, comment_type, notify_callback=notify_qq)
+            if success:
                 if notify_callback:
-                    notify_callback(f"✅ B站回复完成\n内容: {reply_text[:150]}")
+                    notify_callback(f"✅ B站回复完成\n内容: {reply_text[:300]}")
                 return True, top_root_id
             else:
                 print(f"  ❌ 回复失败: {resp.get('message', '')}")
@@ -1613,8 +1730,6 @@ def handle_chat_message(item: dict, bv: str, comment_type: int,
         # --- 回复总结 ---
         if video_summary_for_reply:
             reply_text = video_summary_for_reply
-            if len(reply_text) > 150:
-                reply_text = reply_text[:147] + "..."
         else:
             reply_text = "已经帮您总结过了,你可以在之前的评论中查看。"
             print(f"  ⚠️ 视频总结为空,回复提示")
@@ -1649,15 +1764,12 @@ def handle_chat_message(item: dict, bv: str, comment_type: int,
         )
         print(f"  回复: {reply_text[:100]}...")
 
-        if len(reply_text) > 150:
-            reply_text = reply_text[:147] + "..."
-
     # 7. 发送回复
-    resp = reply_comment(subject_id, top_root_id, parent_id, reply_text, comment_type)
-    if resp.get('code') == 0:
+    success, resp = send_reply_with_audit_check(subject_id, top_root_id, parent_id, reply_text, comment_type, notify_callback=notify_qq)
+    if success:
         print(f"  ✅ 回复成功!")
         if notify_callback:
-            snippet = reply_text[:150]
+            snippet = reply_text[:300]
             notify_callback(f"✅ B站回复完成\n内容: {snippet}")
         return True, top_root_id  # 返回root_id供调用方注册线程
     else:
@@ -1731,8 +1843,8 @@ def process_new_at_messages():
                     root_id = source_id
 
                 reply_text = "内容由于官方机制,暂时无法访问,无法分析总结。"
-                resp = reply_comment(subject_id, root_id, source_id, reply_text, business_id)
-                if resp.get('code') == 0:
+                success, resp = send_reply_with_audit_check(subject_id, root_id, source_id, reply_text, business_id, notify_callback=notify_qq)
+                if success:
                     print(f"  ✅ 已回复官方内容提示")
                     notify_qq(f"⚠️ B站回复(官方内容)\n用户: {user}\n视频: {bv}\n原因: {official_reason}")
                 else:
@@ -1762,8 +1874,8 @@ def process_new_at_messages():
 
             if summary == "__MODEL_UNAVAILABLE__":
                 reply_text = "当前模型无法访问到,请稍后重试"
-                resp = reply_comment(subject_id, root_id, source_id, reply_text, comment_type)
-                if resp.get('code') == 0:
+                success, resp = send_reply_with_audit_check(subject_id, root_id, source_id, reply_text, comment_type, notify_callback=notify_qq)
+                if success:
                     print(f"  ⚠️  模型不可用,已回复提示")
                     notify_qq(f"⚠️ B站回复(模型不可用)\n用户: {user}\n已回复提示")
                 save_state(source_id)
@@ -1771,13 +1883,11 @@ def process_new_at_messages():
                 continue
 
             reply_text = summary
-            if len(reply_text) > 150:
-                reply_text = reply_text[:147] + "..."
 
-            resp = reply_comment(subject_id, root_id, source_id, reply_text, comment_type)
-            if resp.get('code') == 0:
+            success, resp = send_reply_with_audit_check(subject_id, root_id, source_id, reply_text, comment_type, notify_callback=notify_qq)
+            if success:
                 print(f"  ✅ 回复成功!")
-                notify_qq(f"✅ B站动态回复完成\n用户: {user}\n\n{summary[:150]}")
+                notify_qq(f"✅ B站动态回复完成\n用户: {user}\n\n{summary[:300]}")
             else:
                 print(f"  ❌ 回复失败: {resp.get('message', '')}")
 
