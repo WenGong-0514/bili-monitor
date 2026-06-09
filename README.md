@@ -1,6 +1,18 @@
 # Bili Monitor - B站@消息AI自动监控
 
-> 🤖 **这是一个纯 AI 项目** — 从视频分析、语音识别、内容总结到评论区对话，全部由 AI 模型自动完成，无需人工干预。
+> ⚠️ **AI Generated Project** — 本项目的全部代码均由 AI（大语言模型）在人工提示词引导下自动生成，**未经过专业人工代码审核**。仅供学习交流使用，使用者需自行承担所有风险。详见下方免责声明。
+
+---
+
+## ⚠️ 免责声明
+
+**本项目代码完全由 AI 生成，未经人工审核。** 克隆、使用、修改或分发本项目的任何行为所造成的直接或间接损失（包括但不限于账号封禁、数据丢失、财产损失、法律纠纷等），与项目作者无任何关系。使用者应当：
+
+- 在使用前自行审查全部代码
+- 了解本脚本涉及B站账号自动化操作，可能违反B站用户协议
+- 自行承担使用本项目的所有风险和后果
+
+---
 
 B站自动监控脚本：检测到 `@Bot` 后自动下载视频 → 截帧分析 + ASR语音识别 → GLM总结 → 评论区回复，同时通过QQ Bot通知。
 
@@ -44,7 +56,8 @@ nohup python3 -u bili_monitor.py >> /tmp/bili_monitor.log 2>&1 &
 |------|------|
 | `bilibili.sessdata` | B站登录Cookie |
 | `bilibili.bili_jct` | B站CSRF Token |
-| `bilibili.wengong_mid` | Bot账号的B站UID |
+| `bilibili.bot_mid` | Bot账号的B站UID |
+| `bilibili.bot_name` | Bot在B站的昵称（用于识别@消息） |
 | `zhipu.api_key` | 智谱AI API Key |
 | `qq.openid` | QQ通知目标OpenID |
 
