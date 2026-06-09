@@ -38,5 +38,10 @@
     "proxy": {
         "host": "127.0.0.1",
         "port": 7890
+    },
+    "github": {
+        "token": "YOUR_GITHUB_TOKEN_HERE",
+        "repo": "",
+        "note": "token 仅用于项目上传至 GitHub, 不参与脚本运行。repo 填写 owner/repo-name 格式, 如 'wengong/bili-monitor'"
     }
 }
