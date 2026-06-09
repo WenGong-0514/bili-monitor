@@ -1,0 +1,42 @@
+{
+    "bilibili": {
+        "sessdata": "YOUR_SESSDATA_HERE",
+        "bili_jct": "YOUR_BILI_JCT_HERE",
+        "wengong_mid": 0
+    },
+    "zhipu": {
+        "api_key": "YOUR_ZHIPU_API_KEY_HERE"
+    },
+    "dashscope": {
+        "api_key": "YOUR_DASHSCOPE_API_KEY_HERE"
+    },
+    "qq": {
+        "openid": "YOUR_QQ_OPENID_HERE"
+    },
+    "monitor": {
+        "poll_interval": 15,
+        "work_dir": "/tmp/bili_monitor",
+        "state_file": "/tmp/bili_replied_ids.txt",
+        "summary_file": "/tmp/bili_video_summaries.json",
+        "active_threads_file": "/tmp/bili_active_threads.json"
+    },
+    "asr": {
+        "model_chain": [
+            "qwen3-asr-flash-2026-02-10",
+            "qwen3-asr-flash-2025-09-08",
+            "qwen3-asr-flash"
+        ],
+        "chunk_duration": 280,
+        "chunk_max_bytes": 9437184
+    },
+    "visual": {
+        "model_chain": [
+            "glm-4.6v-flash",
+            "glm-4v-flash"
+        ]
+    },
+    "proxy": {
+        "host": "127.0.0.1",
+        "port": 7890
+    }
+}
