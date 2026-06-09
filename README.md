@@ -1,6 +1,8 @@
-# B站@消息自动监控 - AI视频总结 & 评论区对话
+# Bili Monitor - B站@消息AI自动监控
 
-B站自动监控脚本：检测到 `@文共` 后自动下载视频 → 截帧分析 + ASR语音识别 → GLM总结 → 评论区回复，同时通过QQ Bot通知。
+> 🤖 **这是一个纯 AI 项目** — 从视频分析、语音识别、内容总结到评论区对话，全部由 AI 模型自动完成，无需人工干预。
+
+B站自动监控脚本：检测到 `@Bot` 后自动下载视频 → 截帧分析 + ASR语音识别 → GLM总结 → 评论区回复，同时通过QQ Bot通知。
 
 ## 功能
 
@@ -42,7 +44,7 @@ nohup python3 -u bili_monitor.py >> /tmp/bili_monitor.log 2>&1 &
 |------|------|
 | `bilibili.sessdata` | B站登录Cookie |
 | `bilibili.bili_jct` | B站CSRF Token |
-| `bilibili.wengong_mid` | 被监控账号的B站UID |
+| `bilibili.wengong_mid` | Bot账号的B站UID |
 | `zhipu.api_key` | 智谱AI API Key |
 | `qq.openid` | QQ通知目标OpenID |
 

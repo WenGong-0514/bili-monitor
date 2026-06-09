@@ -7,7 +7,7 @@
 
 ## 概述
 
-B站@消息自动监控脚本，常驻后台运行。检测到 `@文共` 后自动处理（首次@必做视频分析，后续根据意图回复总结或结合视频内容对话），并通过 QQ Bot 通知用户。
+B站@消息AI自动监控脚本，常驻后台运行。🤖 **纯 AI 项目** — 从视频分析、语音识别、内容总结到评论区对话，全部由 AI 模型自动完成，无需人工干预。检测到 `@Bot` 后自动处理（首次@必做视频分析，后续根据意图回复总结或结合视频内容对话），并通过 QQ Bot 通知用户。
 
 ## 版本历史
 
@@ -130,7 +130,7 @@ main()  - 15秒循环
   └── reply > 0 → process_new_reply_messages()  GET /x/msgfeed/reply
       │
       └── 对每条回复通知:
-          ├── 检查 at_details 是否包含文共UID
+          ├── 检查 at_details 是否包含Bot UID
           └── handle_chat_message()
 ```
 
@@ -163,7 +163,7 @@ main()  - 15秒循环
 |-----------|------|
 | `_load_config()` | 从 config.json 加载配置(支持 --config 参数 / BILI_CONFIG 环境变量 / 同目录 config.json) |
 | `SESSDATA` / `BILI_JCT` | B站登录Cookie, 从 config.json `bilibili` 节读取 |
-| `WENGONG_MID` | 文共的B站UID, 从 config.json `bilibili.wengong_mid` 读取 |
+| `BOT_MID` | Bot的B站UID, 从 config.json `bilibili.bot_mid` 读取 |
 | `ZHIPU_API_KEY` | 智谱AI API Key, 从 config.json `zhipu.api_key` 读取 |
 | `DASHSCOPE_API_KEY` | 阿里云百炼语音识别, 从 config.json `dashscope.api_key` 读取(兼容环境变量) |
 | `ASR_MODEL_CHAIN` | ASR降级链, 从 config.json `asr.model_chain` 读取 |
@@ -216,8 +216,8 @@ main()  - 15秒循环
 | 函数 | 说明 |
 |------|------|
 | `handle_chat_message(item, bv, comment_type, notify_callback)` | **对话处理核心**: 提取文字→获取上下文→意图分类→执行总结/聊天/视频追问→发回复 |
-| `extract_dialog_context(sub_replies, our_mid)` | 从子评论中提取 @文共 的历史对话 |
-| `extract_message_after_at(text, at_name)` | 提取 @文共 之后的有效文字 |
+| `extract_dialog_context(sub_replies, our_mid)` | 从子评论中提取 @Bot 的历史对话 |
+| `extract_message_after_at(text, at_name)` | 提取 @Bot 之后的有效文字 |
 | `classify_user_intent(user_message, has_video_summary, api_key)` | **v5修复** — 意图分类三层: 总结关键词 → 短消息白名单 → LLM分类 `summary/chat/video_chat` |
 | `generate_chat_reply(context, user_message, ..., visual_context='')` | GLM生成对话回复, **v4新增 `visual_context` 参数支持视频追问** |
 
@@ -320,7 +320,7 @@ v5.4 之后: 首次@必做视频分析, 意图分类只决定回复内容
 ### 路径1: 首次@ (无缓存) — 视频总结
 
 ```
-用户发主评论 "@文共 总结一下"  (或任何首次@)
+用户发主评论 "@Bot 总结一下"  (或任何首次@)
   ↓
 GET /x/msgfeed/unread  →  at=1
   ↓
@@ -348,7 +348,7 @@ handle_chat_message()
 ### 路径2: 首次@但意图为 chat — 结合视频内容对话
 
 ```
-用户 "@文共 @其他人 哈哈这个视频有意思"
+用户 "@Bot @其他人 哈哈这个视频有意思"
   ↓
 handle_chat_message()
   ├─ [v5.4] 检查缓存 → 无缓存 → 必做视频分析
@@ -366,7 +366,7 @@ handle_chat_message()
 ### 路径3: 已有缓存 + 任意意图
 
 ```
-用户 "@文共 视频里那个人穿的什么衣服？"
+用户 "@Bot 视频里那个人穿的什么衣服？"
   ↓
 handle_chat_message()
   ├─ [v5.4] 检查缓存 → 有缓存 → 直接复用, 不重复下载
@@ -465,13 +465,14 @@ handle_chat_message()
 ```
 v5.3: 已不再出现在回复文本中, 仅内部记录。
 
-### 修改文共UID (如果换号)
+### 修改Bot UID (如果换号)
 
 编辑 `config.json`:
 ```json
 {
     "bilibili": {
-        "wengong_mid": 71098647
+        "bot_mid": 12345,
+        "bot_name": "你的Bot名称"
     }
 }
 ```
