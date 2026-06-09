@@ -2,7 +2,8 @@
     "bilibili": {
         "sessdata": "YOUR_SESSDATA_HERE",
         "bili_jct": "YOUR_BILI_JCT_HERE",
-        "wengong_mid": 0
+        "bot_mid": 0,
+        "bot_name": "你的Bot名称"
     },
     "zhipu": {
         "api_key": "YOUR_ZHIPU_API_KEY_HERE"
@@ -42,6 +43,6 @@
     "github": {
         "token": "YOUR_GITHUB_TOKEN_HERE",
         "repo": "",
-        "note": "token 仅用于项目上传至 GitHub, 不参与脚本运行。repo 填写 owner/repo-name 格式, 如 'wengong/bili-monitor'"
+        "note": "token 仅用于项目上传至 GitHub, 不参与脚本运行"
     }
 }

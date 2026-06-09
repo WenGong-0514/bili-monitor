@@ -9,9 +9,9 @@
    - 使用B站 unread 接口做轻量检查(at=0 则跳过,几乎零开销)
    - 发现新@消息 → 判断类型(视频/动态/官方内容) → 处理 → 回复
    - 首次@必做视频分析(下载+截帧+ASR+总结),后续复用缓存
-   - 评论区聊天: @文共 + 文字 → GLM意图分类 → 回复总结/结合视频对话
+   - 评论区聊天: @Bot + 文字 → GLM意图分类 → 回复总结/结合视频对话
    - 同一视频总结只触发一次,后续请求复用缓存
-   - 主评论间消息隔离,子评论上下文仅包含@文共与文共回复
+   - 主评论间消息隔离,子评论上下文仅包含@Bot与Bot回复
    - 同时通过QQ Bot主动通知用户
 
  ⚠️  启动前必读:
@@ -105,7 +105,8 @@ _CFG = _load_config()
 # --- B站认证 ---
 SESSDATA = _CFG["bilibili"]["sessdata"]
 BILI_JCT = _CFG["bilibili"]["bili_jct"]
-WENGONG_MID = _CFG["bilibili"]["wengong_mid"]
+BOT_MID = _CFG["bilibili"]["bot_mid"]
+BOT_NAME = _CFG["bilibili"].get("bot_name", "")  # Bot在B站的昵称, 用于识别@消息
 
 # --- 智谱AI API ---
 ZHIPU_API_KEY = _CFG["zhipu"]["api_key"]
@@ -243,7 +244,7 @@ def save_summary(bv: str, summary: str, duration_str: str):
 # ============================================================================
 # B站@消息推送只包含主评论@,不包含子评论(评论的评论)中的@。
 # 因此需要额外维护"活跃线程表":记录我们回复过的主评论,
-# 定期扫描这些评论下是否有新的子评论@文共。
+# 定期扫描这些评论下是否有新的子评论@Bot。
 
 
 def load_active_threads() -> dict:
@@ -395,7 +396,7 @@ def fetch_top_level_comments(oid, comment_type, max_pages=3):
     """
     获取内容的顶级评论列表。
 
-    用于: 当通过子评论@文共时,需要找到它的根评论。
+    用于: 当通过子评论@Bot时,需要找到它的根评论。
 
     接口: /x/v2/reply/main
     """
@@ -425,16 +426,16 @@ def fetch_top_level_comments(oid, comment_type, max_pages=3):
 
 def extract_dialog_context(sub_replies: list, our_mid: int) -> list:
     """
-    从子评论列表中提取 @文共 与 文共回复 的对话上下文。
+    从子评论列表中提取 @Bot 与 Bot回复 的对话上下文。
 
     规则:
-    - 只保留包含@文共(或@到文共)的消息
-    - 以及文共(mid=our_mid)自己发出的回复
+    - 只保留包含@Bot(或@到Bot)的消息
+    - 以及Bot(mid=our_mid)自己发出的回复
     - 按时间排序
 
     Args:
         sub_replies: fetch_comment_thread 返回的子评论列表
-        our_mid: 文共的B站UID
+        our_mid: Bot的B站UID
 
     Returns:
         按时间顺序排列的消息列表, 每项: {role: "user"/"assistant", content: str, mid: int}
@@ -448,7 +449,7 @@ def extract_dialog_context(sub_replies: list, our_mid: int) -> list:
         rpid = reply.get('rpid', 0)
         ctime = reply.get('ctime', 0)
 
-        # 文共自己的回复 → assistant
+        # Bot自己的回复 → assistant
         if mid == our_mid:
             # 过滤掉已知的fallback消息(避免污染对话上下文)
             skip_patterns = [
@@ -468,24 +469,24 @@ def extract_dialog_context(sub_replies: list, our_mid: int) -> list:
                 })
             continue
 
-        # 检查是否@了文共 (多种检测方式)
-        has_at_wengong = False
+        # 检查是否@了Bot (多种检测方式)
+        has_at_bot = False
 
-        # 方式1: 文本中包含 "@文共"
-        if '@文共' in message:
-            has_at_wengong = True
+        # 方式1: 文本中包含 "@Bot"
+        if f'@{BOT_NAME}' in message:
+            has_at_bot = True
 
         # 方式2: members字段中查找 (B站新版API在members中包含@信息)
-        if not has_at_wengong:
+        if not has_at_bot:
             members = content_obj.get('members', [])
             if members and isinstance(members, list):
                 for member in members:
                     if member.get('mid') == str(our_mid) or member.get('mid') == our_mid:
-                        has_at_wengong = True
+                        has_at_bot = True
                         break
 
         # 方式3: at_uids字段 (旧版或特定接口)
-        if not has_at_wengong:
+        if not has_at_bot:
             at_uids_raw = content_obj.get('at_uids', '')
             if at_uids_raw:
                 try:
@@ -494,13 +495,13 @@ def extract_dialog_context(sub_replies: list, our_mid: int) -> list:
                     else:
                         at_uids = [int(at_uids_raw)] if isinstance(at_uids_raw, (int,)) else []
                     if our_mid in at_uids:
-                        has_at_wengong = True
+                        has_at_bot = True
                 except (ValueError, TypeError):
                     pass
 
-        if has_at_wengong:
-            # 提取@文共之后的有效文字(去掉@文共前缀)
-            user_text = extract_message_after_at(message, "文共")
+        if has_at_bot:
+            # 提取@Bot之后的有效文字(去掉@Bot前缀)
+            user_text = extract_message_after_at(message, BOT_NAME)
             context.append({
                 "role": "user",
                 "content": user_text,
@@ -514,15 +515,15 @@ def extract_dialog_context(sub_replies: list, our_mid: int) -> list:
     return context
 
 
-def extract_message_after_at(text: str, at_name: str = "文共") -> str:
+def extract_message_after_at(text: str, at_name: str = "") -> str:
     """
-    提取@文共之后的文字内容。
+    提取@Bot之后的文字内容。
 
     规则:
-    - "@文共" 在开头 → 取后面内容
-    - "@文共" 在中间/末尾且后无文字 → 返回空(表示纯@,触发总结)
+    - "@Bot" 在开头 → 取后面内容
+    - "@Bot" 在中间/末尾且后无文字 → 返回空(表示纯@,触发总结)
     - 忽略@之前的无关文字
-    - B站子评论前缀 "回复 @文共 :" 会被自动去掉
+    - B站子评论前缀 "回复 @Bot :" 会被自动去掉
 
     Args:
         text: 原始评论文本
@@ -532,12 +533,12 @@ def extract_message_after_at(text: str, at_name: str = "文共") -> str:
         @之后的有效文字(可能为空字符串)
     """
     # 先去除B站自动添加的 "回复 @xxx :" 前缀
-    # 格式: "回复 @文共 :" 或 "回复 @某人 :@文共 xxx"
+    # 格式: "回复 @Bot :" 或 "回复 @某人 :@Bot xxx"
     reply_prefix = re.match(rf'回复\s*@{at_name}\s*[::]\s*', text)
     if reply_prefix:
         text = text[reply_prefix.end():]
 
-    # 匹配 @文共 (可能有空格、标点等前缀)
+    # 匹配 @Bot (可能有空格、标点等前缀)
     pattern = rf'@{at_name}\s*'
     match = re.search(pattern, text)
     if not match:
@@ -603,12 +604,12 @@ def classify_user_intent(user_message: str, has_video_summary: bool, api_key: st
     用GLM-5.1判断用户意图: 'summary' 还是 'chat'。
 
     规则基础:
-    - 纯@文共(无额外文字) → summary(由调用方判断,此函数处理有文字的情况)
-    - "@文共 总结一下" / "@文共 总结" → summary
+    - 纯@Bot(无额外文字) → summary(由调用方判断,此函数处理有文字的情况)
+    - "@Bot 总结一下" / "@Bot 总结" → summary
     - 其他带文字的@ → 用LLM分类
 
     Args:
-        user_message: @文共之后的有效文字(已去除@前缀)
+        user_message: @Bot之后的有效文字(已去除@前缀)
         has_video_summary: 该视频是否已有总结
 
     Returns:
@@ -705,7 +706,7 @@ def generate_chat_reply(
     """
     用GLM-5.1生成对话回复。
 
-    将对话上下文(只包含@文共的消息和文共的回复)、视频总结、
+    将对话上下文(只包含@Bot的消息和Bot的回复)、视频总结、
     当前用户消息一起传给大模型,生成自然回复。
 
     Args:
@@ -724,7 +725,7 @@ def generate_chat_reply(
     messages = []
 
     # System prompt
-    system_text = "你是文共,一个B站AI助手。你在B站评论区与用户对话。"
+    system_text = "你是一个B站AI助手。你在B站评论区与用户对话。"
     if video_summary and video_summary not in ("", "暂无总结"):
         system_text += f"\n\n重要:你已经看过这个视频《{video_title}》,以下是视频内容总结:\n{video_summary[:1500]}"
         system_text += "\n\n你的回复必须结合视频内容。即使对方只是在闲聊,也要自然地关联到视频相关的话题。不要无视视频内容进行空对空的对话。"
@@ -1535,8 +1536,8 @@ def handle_chat_message(item: dict, bv: str, comment_type: int,
     print(f"  root_id={top_root_id}, parent_id={parent_id}")
     print(f"  原始内容: {source_content[:100]}")
 
-    # 2. 提取@文共之后的有效文字
-    user_text = extract_message_after_at(source_content, "文共")
+    # 2. 提取@Bot之后的有效文字
+    user_text = extract_message_after_at(source_content, BOT_NAME)
     print(f"  有效文字: '{user_text}'" if user_text else "  (纯@,无文字)")
 
     # 3. 加载视频总结缓存
@@ -1552,7 +1553,7 @@ def handle_chat_message(item: dict, bv: str, comment_type: int,
         try:
             sub_replies = fetch_comment_thread(subject_id, top_root_id, comment_type, max_pages=5)
             print(f"  获取到 {len(sub_replies)} 条子评论")
-            dialog_context = extract_dialog_context(sub_replies, WENGONG_MID)
+            dialog_context = extract_dialog_context(sub_replies, BOT_MID)
             print(f"  对话上下文: {len(dialog_context)} 条有效消息")
             for m in dialog_context:
                 print(f"    [{m['role']}] {m['content'][:60]}...")
@@ -1793,14 +1794,14 @@ def process_new_at_messages():
 
 def process_new_reply_messages():
     """
-    获取并处理所有新的评论区回复通知(子评论中@文共)。
+    获取并处理所有新的评论区回复通知(子评论中@Bot)。
 
     msgfeed/reply 推送的是"有人回复了你的评论"的通知。
-    我们只处理其中包含@文共的消息,忽略普通回复。
+    我们只处理其中包含@Bot的消息,忽略普通回复。
 
     数据结构与 at 消息类似,包含:
     - source_content: 回复内容
-    - target_reply_content: 被回复的文共评论内容
+    - target_reply_content: 被回复的Bot评论内容
     - at_details: @的用户列表
     - root_id, source_id, target_id, subject_id, business_id 等
     """
@@ -1819,18 +1820,18 @@ def process_new_reply_messages():
         if not source_id or source_id in replied or reply_source_key in replied:
             continue
 
-        # 检查是否@了文共 (at_details 字段)
+        # 检查是否@了Bot (at_details 字段)
         at_details = item.get('at_details', [])
-        has_at_wengong = False
+        has_at_bot = False
         if at_details:
             for at_user in at_details:
-                if at_user.get('mid') == WENGONG_MID or str(at_user.get('mid')) == str(WENGONG_MID):
-                    has_at_wengong = True
+                if at_user.get('mid') == BOT_MID or str(at_user.get('mid')) == str(BOT_MID):
+                    has_at_bot = True
                     break
 
-        # 也检查文本中是否包含 @文共
+        # 也检查文本中是否包含 @Bot
         source_content = item.get('source_content', '')
-        if not has_at_wengong and '@文共' not in source_content:
+        if not has_at_bot and f'@{BOT_NAME}' not in source_content:
             continue
 
         user = outer_item.get('user', {}).get('nickname', '?')
@@ -1843,7 +1844,7 @@ def process_new_reply_messages():
 
         # 修正 item 字段名以兼容 handle_chat_message
         # msgfeed/reply 的 item 字段名与 msgfeed/at 略有不同
-        # target_id 在 reply 中是被回复的文共评论的 rpid,我们需要 reply 到 source_id
+        # target_id 在 reply 中是被回复的Bot评论的 rpid,我们需要 reply 到 source_id
         item['source_content'] = source_content
 
         print(f"\n{'=' * 50}")
@@ -1897,7 +1898,7 @@ def fetch_reply_messages() -> list:
     """获取评论区回复通知(含子评论中的@)。
     
     msgfeed/reply 推送的是:别人回复了你评论的通知。
-    如果对方在回复中@了文共, at_details 字段会包含文共的信息。
+    如果对方在回复中@了Bot, at_details 字段会包含Bot的信息。
     """
     d = api_get("https://api.bilibili.com/x/msgfeed/reply?build=0&mobi_app=web")
     if d.get('code') != 0:
@@ -1921,7 +1922,7 @@ def main():
     print(f" 视频总结数: {len(load_summaries())}", flush=True)
     print(f" ASR密钥: {'已配置' if DASHSCOPE_API_KEY else '❌ 未配置'}", flush=True)
     print(f" ASR模型链: {' → '.join(ASR_MODEL_CHAIN)}", flush=True)
-    print(f" 文共UID: {WENGONG_MID}", flush=True)
+    print(f" Bot UID: {BOT_MID}", flush=True)
     print("=" * 60, flush=True)
     print(flush=True)
 
@@ -1951,7 +1952,7 @@ def main():
                     print(f"\n[{time.strftime('%H:%M:%S')}] 📬 检测到 {at_count} 条新@消息,开始处理...")
                     process_new_at_messages()
 
-                # 处理回复通知(子评论中的@文共)
+                # 处理回复通知(子评论中的@Bot)
                 if reply_count > 0:
                     print(f"\n[{time.strftime('%H:%M:%S')}] 💬 检测到 {reply_count} 条新回复,开始处理...")
                     process_new_reply_messages()
