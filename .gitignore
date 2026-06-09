@@ -1,0 +1,13 @@
+# 真实配置文件（包含密钥，不上传）
+config.json
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+.venv/
+venv/
+
+# 工作文件
+/tmp/
+*.log
