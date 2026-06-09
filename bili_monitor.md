@@ -1,7 +1,7 @@
 # bili_monitor.py 架构文档
 
-> 最后更新: 2026-06-03
-> 版本: v5.4 (首次@必分析 + 结合视频内容对话)
+> 最后更新: 2026-06-09
+> 版本: v5.4.1 (配置外部化 + GitHub上传支持)
 
 ---
 
@@ -577,3 +577,43 @@ B站对评论有自动审核机制，回复发送成功(code=0)后仍可能被�
 - [x] 2026-05-28: **文档更新** — 补充 Cookie 扫码登录方式、Clash 代理管理说明 (clashctl/mihomo)、心跳频率说明 (20轮=5分钟)、代理故障排查步骤。
 - [x] 2026-06-01: **回复被B站审核折叠(state=17)** — 长回复(>300字)和带机器人前缀的回复频繁被B站审核系统折叠。已将所有回复限制在150字内，去掉机器人前缀，总结要求不换行不分点。经测试97字纯自然语言回复可正常显示(state=0)。
 - [x] 2026-06-03: **v5.4 首次@必做视频分析 + chat回复结合视频内容** — 原逻辑中 chat 意图会跳过视频下载, 导致空对空聊天。用户@了多人但不打算聊天时, 回复内容与语境完全不符。改为: (1)首次@无缓存时无论意图都必做视频分析; (2)chat 回复的 system prompt 强制要求结合视频内容; (3)意图分类 prompt 增加模糊消息优先判为 summary 的原则。
+- [x] 2026-06-09: **v5.4.1 配置外部化 + GitHub上传支持** — 所有硬编码密钥/参数改为从 config.json 读取。新增 config.example.json 模板。.gitignore 排除 config.json 防止泄露。配置文件支持 --config 参数 / BILI_CONFIG 环境变量 / 同目录 config.json 三级优先。GitHub token 存入 config.json 供上传使用。
+
+---
+
+## GitHub 上传指南
+
+项目支持通过 config.json 中的 `github` 字段管理 GitHub 仓库。
+
+### config.json 中的 GitHub 配置
+
+```json
+{
+    "github": {
+        "token": "ghp_xxxxxxxxxxxx",
+        "repo": "owner/repo-name",
+        "note": "token 仅用于项目上传至 GitHub, 不参与脚本运行"
+    }
+}
+```
+
+### 字段说明
+
+| 字段 | 说明 |
+|------|------|
+| `github.token` | GitHub Personal Access Token, 需要 `repo` 权限(完整仓库读写) |
+| `github.repo` | 目标仓库, 格式 `owner/repo-name`, 如 `wengong/bili-monitor` |
+| `github.note` | 备注说明, 仅供阅读理解, 不参与任何逻辑 |
+
+### 安全说明
+
+- `config.json` 已被 `.gitignore` 排除, token 不会上传到仓库
+- `config.example.json` 中仅包含占位符 `YOUR_GITHUB_TOKEN_HERE`
+- token 仅用于大模型/脚本读取后调用 GitHub API 上传项目, **不参与 bili_monitor.py 的运行逻辑**
+
+### 上传流程 (大模型参考)
+
+1. 读取 config.json 中的 `github.token` 和 `github.repo`
+2. 使用 GitHub API 创建仓库 (如不存在): `POST https://api.github.com/user/repos`
+3. 添加远程仓库: `git remote add origin https://x-access-token:<token>@github.com/<repo>.git`
+4. 推送: `git push -u origin master`
