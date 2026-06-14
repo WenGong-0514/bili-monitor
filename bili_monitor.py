@@ -154,6 +154,17 @@ POLL_INTERVAL = _monitor_cfg.get("poll_interval", 15)
 
 os.makedirs(WORK_DIR, exist_ok=True)
 
+# 生成 yt-dlp 使用的 Netscape cookies 文件
+# B站对 --add-header 传 Cookie 的方式会返回 412, 必须用 --cookies 文件
+COOKIES_FILE = os.path.join(WORK_DIR, 'bili_cookies.txt')
+def _write_cookies_file():
+    """将B站Cookie写入 Netscape 格式的 cookies 文件, 供 yt-dlp 使用。"""
+    with open(COOKIES_FILE, 'w') as f:
+        f.write('# Netscape HTTP Cookie File\n')
+        f.write(f'.bilibili.com\tTRUE\t/\tFALSE\t1795513094\tSESSDATA\t{SESSDATA}\n')
+        f.write(f'.bilibili.com\tTRUE\t/\tTRUE\t1795513094\tbili_jct\t{BILI_JCT}\n')
+_write_cookies_file()
+
 # ============================================================================
 # 代理初始化 (依赖配置)
 # ============================================================================
@@ -996,17 +1007,33 @@ def get_video_duration(bv: str) -> int:
 
 
 def download_video(bv: str, output_path: str) -> bool:
+    """下载B站视频。
+
+    使用 --cookies 文件传递Cookie(而非 --add-header),
+    避免 B站 playinfo API 返回 412 Precondition Failed。
+    格式优先 30016+30216 (360p+64k audio), 失败则回退到 best。
+    """
     url = f"https://www.bilibili.com/video/{bv}"
-    r = subprocess.run([
-        'yt-dlp',
-        '-f', '30016+30216',
-        '--merge-output-format', 'mp4',
-        '-o', output_path,
-        '--add-header', f'Cookie: {COOKIES}',
-        '--add-header', 'Referer: https://www.bilibili.com/',
-        '--no-warnings',
-        url
-    ], capture_output=True, text=True, timeout=180)
+
+    # 首选格式: 360p视频 + 64k音频 (文件小, 够用于截帧和ASR)
+    for fmt in ['30016+30216', 'best']:
+        r = subprocess.run([
+            'yt-dlp',
+            '-f', fmt,
+            '--merge-output-format', 'mp4',
+            '-o', output_path,
+            '--cookies', COOKIES_FILE,
+            '--add-header', 'Referer: https://www.bilibili.com/',
+            '--no-warnings',
+            url
+        ], capture_output=True, text=True, timeout=180)
+        if os.path.exists(output_path):
+            return True
+        # 如果首选格式就失败了, 不要重复尝试 best
+        if fmt == '30016+30216' and 'Requested format is not available' not in r.stderr:
+            # 格式没问题但下载失败(网络/权限等), best 也大概率失败
+            print(f"  yt-dlp 错误: {r.stderr[:200]}", flush=True)
+            break
     return os.path.exists(output_path)
 
 
