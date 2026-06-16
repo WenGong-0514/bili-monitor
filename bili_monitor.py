@@ -767,7 +767,24 @@ def classify_user_intent(user_message: str, has_video_summary: bool, api_key: st
         '这是啥', '啥内容', '这是什么', '这啥', '讲啥', '讲什么',
         '概括', '帮我看看',
     ]
-    if len(msg_lower) <= 5:
+    # 常见的闲聊/水评论/语气词 → 直接判为 chat,不走LLM(省钱省时间)
+    chat_patterns = [
+        '阿巴', '啊啊', '哈哈哈哈', '哈哈哈', '呵呵', '嘿嘿', '嘻嘻',
+        '666', '777', '888', '999', '好', '好的', '收到', 'OK',
+        '牛', '牛逼', 'nb', 'NB', '厉害', '强',
+        '草', '艹', '啊这', '乐', '笑死', '绷不住',
+        'doge', '是的', '对的', '没错', '确实',
+        '在吗', '你好', '哈喽', 'hello', 'hi',
+        '？', '?', '。。', '...', '。。。',
+        '搞莫子', '干嘛', '咋了', '怎么', '什么鬼',
+        '谢谢', '感谢', '多谢', '辛苦了',
+        '加油', '支持', '赞', '酷', 'nice',
+    ]
+    if len(msg_lower) <= 8:
+        # 先检查是否是闲聊/水评论
+        for p in chat_patterns:
+            if p in msg_lower:
+                return "chat"
         is_summary_like = any(p in msg_lower for p in short_summary_patterns)
         if is_summary_like:
             return "summary"
@@ -1752,7 +1769,29 @@ def handle_chat_message(item: dict, bv: str, comment_type: int,
         intent = classify_user_intent(user_text, has_existing_summary or bool(video_summary_for_reply), ZHIPU_API_KEY)
         print(f"  意图: {intent}")
 
-    # 7. 根据意图决定回复内容
+    # 7. 检查是否已经在这个 root 评论下发过总结
+    #    核心规则: 同一个主评论下只发一次总结,后续一律走聊天
+    already_posted_summary_in_thread = False
+    if dialog_context:
+        for msg in dialog_context:
+            if msg.get('role') == 'assistant' and video_summary_for_reply:
+                # 如果Bot之前在这个线程发过的回复和当前总结高度相似(>100字重叠),
+                # 说明已经发过总结了
+                prev_content = msg.get('content', '')
+                if prev_content and len(prev_content) > 50:
+                    # 简单检查: 之前的回复包含总结的关键片段
+                    if video_summary_for_reply[:100] in prev_content or prev_content[:100] in video_summary_for_reply:
+                        already_posted_summary_in_thread = True
+                        break
+
+    # 如果已经发过总结但意图仍是 summary,强制转为 chat
+    if already_posted_summary_in_thread and intent == "summary":
+        print(f"  ⚠️ 该线程下已发过总结,意图从 summary → chat")
+        intent = "chat"
+        if not user_text or not user_text.strip():
+            user_text = "又来啦"
+
+    # 8. 根据意图决定回复内容
     if intent == "summary":
         # --- 回复总结 ---
         if video_summary_for_reply:
