@@ -1023,35 +1023,139 @@ def get_video_duration(bv: str) -> int:
     return 0
 
 
+def _download_single_p(bv: str, p_index: int, output_path: str, fmt: str) -> bool:
+    """下载分P视频的指定P。"""
+    url = f"https://www.bilibili.com/video/{bv}?p={p_index}"
+    r = subprocess.run([
+        'yt-dlp',
+        '-f', fmt,
+        '--merge-output-format', 'mp4',
+        '-o', output_path,
+        '--cookies', COOKIES_FILE,
+        '--add-header', 'Referer: https://www.bilibili.com/',
+        '--no-warnings',
+        url
+    ], capture_output=True, text=True, timeout=300)
+    return os.path.exists(output_path)
+
+
 def download_video(bv: str, output_path: str) -> bool:
-    """下载B站视频。
+    """下载B站视频（含全部分P）。
 
     使用 --cookies 文件传递Cookie(而非 --add-header),
     避免 B站 playinfo API 返回 412 Precondition Failed。
     格式优先 30016+30216 (360p+64k audio), 失败则回退到 best。
+
+    分P处理: 先检测分P数量, 多P时逐个下载再合并为单文件。
     """
     url = f"https://www.bilibili.com/video/{bv}"
 
-    # 首选格式: 360p视频 + 64k音频 (文件小, 够用于截帧和ASR)
-    for fmt in ['30016+30216', 'best']:
-        r = subprocess.run([
-            'yt-dlp',
-            '-f', fmt,
-            '--merge-output-format', 'mp4',
-            '-o', output_path,
-            '--cookies', COOKIES_FILE,
-            '--add-header', 'Referer: https://www.bilibili.com/',
-            '--no-warnings',
-            url
-        ], capture_output=True, text=True, timeout=180)
-        if os.path.exists(output_path):
-            return True
-        # 如果首选格式就失败了, 不要重复尝试 best
-        if fmt == '30016+30216' and 'Requested format is not available' not in r.stderr:
-            # 格式没问题但下载失败(网络/权限等), best 也大概率失败
-            print(f"  yt-dlp 错误: {r.stderr[:200]}", flush=True)
-            break
-    return os.path.exists(output_path)
+    # 检测分P数量
+    playlist_info = subprocess.run([
+        'yt-dlp',
+        '--flat-playlist',
+        '--dump-json',
+        '--cookies', COOKIES_FILE,
+        '--add-header', 'Referer: https://www.bilibili.com/',
+        '--no-warnings',
+        url
+    ], capture_output=True, text=True, timeout=60)
+
+    p_count = 0
+    for line in playlist_info.stdout.strip().split('\n'):
+        if line.strip():
+            p_count += 1
+
+    if p_count <= 1:
+        # 单P视频, 直接下载
+        for fmt in ['30016+30216', 'best']:
+            r = subprocess.run([
+                'yt-dlp',
+                '-f', fmt,
+                '--merge-output-format', 'mp4',
+                '-o', output_path,
+                '--cookies', COOKIES_FILE,
+                '--add-header', 'Referer: https://www.bilibili.com/',
+                '--no-warnings',
+                url
+            ], capture_output=True, text=True, timeout=300)
+            if os.path.exists(output_path):
+                return True
+            if fmt == '30016+30216' and 'Requested format is not available' not in r.stderr:
+                print(f"  yt-dlp 错误: {r.stderr[:200]}", flush=True)
+                break
+        return os.path.exists(output_path)
+
+    # 多P视频: 逐P下载 → ffmpeg concat 合并
+    print(f"  检测到 {p_count} 个分P, 开始逐P下载...", flush=True)
+    tmp_dir = os.path.dirname(output_path)
+    part_files = []
+    fmt = '30016+30216'
+
+    for i in range(1, p_count + 1):
+        part_path = f"{tmp_dir}/part_p{i}.mp4"
+        print(f"    下载 P{i}/{p_count}...", flush=True)
+        if not _download_single_p(bv, i, part_path, fmt):
+            # 格式回退
+            if not _download_single_p(bv, i, part_path, 'best'):
+                print(f"    ⚠️ P{i} 下载失败", flush=True)
+                # 已下载的部分仍然可用, 继续合并
+                break
+        if os.path.exists(part_path):
+            part_files.append(part_path)
+
+    if not part_files:
+        return False
+
+    if len(part_files) == 1:
+        # 只成功下载了一个P
+        import shutil
+        shutil.move(part_files[0], output_path)
+        return os.path.exists(output_path)
+
+    # 用 ffmpeg concat demuxer 合并
+    concat_list = f"{tmp_dir}/concat_list.txt"
+    with open(concat_list, 'w') as f:
+        for pf in part_files:
+            f.write(f"file '{os.path.basename(pf)}'\n")
+
+    concat_r = subprocess.run([
+        'ffmpeg',
+        '-f', 'concat',
+        '-safe', '0',
+        '-i', concat_list,
+        '-c', 'copy',
+        '-y',
+        output_path
+    ], capture_output=True, text=True, timeout=180, cwd=tmp_dir)
+
+    # concat copy 失败时重编码
+    if not os.path.exists(output_path) or os.path.getsize(output_path) < 1024:
+        print(f"    concat copy 失败, 尝试重编码合并...", flush=True)
+        concat_r = subprocess.run([
+            'ffmpeg',
+            '-f', 'concat',
+            '-safe', '0',
+            '-i', concat_list,
+            '-c:v', 'libx264',
+            '-crf', '28',
+            '-preset', 'fast',
+            '-c:a', 'aac',
+            '-y',
+            output_path
+        ], capture_output=True, text=True, timeout=600, cwd=tmp_dir)
+
+    # 清理临时文件
+    for pf in part_files:
+        if os.path.exists(pf):
+            os.remove(pf)
+    if os.path.exists(concat_list):
+        os.remove(concat_list)
+
+    success = os.path.exists(output_path) and os.path.getsize(output_path) > 1024
+    if success:
+        print(f"  ✅ {len(part_files)}P 合并完成", flush=True)
+    return success
 
 
 # ============================================================================
@@ -1067,7 +1171,7 @@ def extract_frames(video_path: str, frames_dir: str, interval: int = 2) -> list:
         '-q:v', '3',
         '-y',
         f'{frames_dir}/frame_%04d.jpg'
-    ], capture_output=True, text=True, timeout=120)
+    ], capture_output=True, text=True, timeout=300)
     return sorted(glob.glob(f"{frames_dir}/frame_*.jpg"))
 
 
@@ -1181,7 +1285,7 @@ def extract_audio(video_path: str, output_path: str) -> bool:
         '-codec:a', 'libmp3lame',
         '-q:a', '4',
         '-y', output_path
-    ], capture_output=True, text=True, timeout=120)
+    ], capture_output=True, text=True, timeout=300)
     return os.path.exists(output_path)
 
 
@@ -2089,7 +2193,7 @@ def fetch_reply_messages() -> list:
 
 def main():
     print("=" * 60, flush=True)
-    print(f" B站@消息监控已启动 (v5.4: 首次@必分析 + 结合视频内容对话)", flush=True)
+    print(f" B站@消息监控已启动 (v5.5: 分P视频支持 + 首次@必分析 + 结合视频内容对话)", flush=True)
     print(f" 轮询间隔: {POLL_INTERVAL}秒", flush=True)
     print(f" 工作目录: {WORK_DIR}", flush=True)
     print(f" 状态文件: {STATE_FILE}", flush=True)
