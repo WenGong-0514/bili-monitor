@@ -2,8 +2,8 @@
 
 > ⚠️ **AI Generated Project** — 本项目全部代码由 AI 在人工提示词引导下生成，未经人工审核。使用本项目造成的任何损失与作者无关。完整免责声明见文档末尾。
 >
-> 最后更新: 2026-06-14
-> 版本: v5.4.3 (修复视频下载 412 + cookies 文件方式)
+> 最后更新: 2026-06-17
+> 版本: v5.5 (分P视频支持: 逐P下载 + 合并)
 
 ---
 
@@ -25,6 +25,7 @@ B站@消息AI自动监控脚本，常驻后台运行。检测到 `@Bot` 后自�
 | v5.3 | 2026-06-01 | 回复控制在150字内,去掉机器人前缀,解决B站审核折叠问题 |
 | v5.4 | 2026-06-03 | **首次@必做视频分析**,不再因意图分类跳过下载; chat回复强制结合视频内容; 意图分类更严格(模糊消息优先判为summary) |
 | v5.4.3 | 2026-06-14 | **修复视频下载失败**: B站对 `--add-header Cookie` 方式返回 412, 改用 `--cookies` 文件传递 Cookie |
+| v5.5 | 2026-06-17 | **分P视频支持**: 自动检测分P数量, 逐P下载后用 ffmpeg concat 合并为单文件, 确保完整分析 |
 
 ## ⚡ 快速启动/停止
 
@@ -231,7 +232,8 @@ main()  - 15秒循环
 | `get_video_info(bv)` | `GET /x/web-interface/view` — 获取视频信息(含 copyright/rights/tid 等) |
 | `is_official_content(bv)` | **v5修复** — 判断是否番剧/电影等不可下载内容。仅靠 `rights.download=0` + 特殊分区 tid(13/23/167/11/177), 不再误判转载视频 |
 | `get_video_duration(bv)` | 获取视频时长(秒) |
-| `download_video(bv, output_path)` | yt-dlp下载视频 |
+| `_download_single_p(bv, p_index, output_path, fmt)` | 下载分P视频的指定P |
+| `download_video(bv, output_path)` | yt-dlp下载视频(自动检测分P, 多P逐个下载后用 ffmpeg concat 合并) |
 | `extract_frames(video_path, frames_dir, interval)` | ffmpeg截帧 |
 | `extract_audio(video_path, output_path)` | ffmpeg提取音频(mp3) |
 | `process_video(bv, notify_callback)` | **视频处理主流程**: 下载→截帧→ASR→GLM总结→**缓存关键帧base64** |
@@ -584,6 +586,7 @@ B站对评论有自动审核机制，回复发送成功(code=0)后仍可能被�
 - [x] 2026-06-03: **v5.4 首次@必做视频分析 + chat回复结合视频内容** — 原逻辑中 chat 意图会跳过视频下载, 导致空对空聊天。用户@了多人但不打算聊天时, 回复内容与语境完全不符。改为: (1)首次@无缓存时无论意图都必做视频分析; (2)chat 回复的 system prompt 强制要求结合视频内容; (3)意图分类 prompt 增加模糊消息优先判为 summary 的原则。
 - [x] 2026-06-09: **v5.4.1 配置外部化 + GitHub上传支持** — 所有硬编码密钥/参数改为从 config.json 读取。新增 config.example.json 模板。.gitignore 排除 config.json 防止泄露。配置文件支持 --config 参数 / BILI_CONFIG 环境变量 / 同目录 config.json 三级优先。GitHub token 存入 config.json 供上传使用。
 - [x] 2026-06-14: **v5.4.3 视频下载 412 修复** — B站 playinfo API 对 `--add-header Cookie:` 方式返回 HTTP 412 (Precondition Failed), 导致所有视频下载失败、回复均为"视频下载失败"。根因: B站加强反爬, yt-dlp 通过 header 传递 Cookie 时缺少必要的 wbi 签名验证。修复: 改用 `--cookies` Netscape 文件方式传递 Cookie (脚本启动时自动生成 `/tmp/bili_monitor/bili_cookies.txt`)。同时 yt-dlp 从 2026.03.17 更新至 2026.06.09, 增加格式回退逻辑。
+- [x] 2026-06-17: **v5.5 分P视频支持** — 分P视频(如 BV19aVp6dEe7 有2P) 只下载第一P, 导致 ASR 和视觉分析只覆盖小部分内容, GLM-5.1 因信息不足返回"信息不足,无法准确总结"。修复: `download_video()` 新增分P检测, 多P时逐个下载后用 ffmpeg concat demuxer 合并为单文件(concat copy 失败时自动降级重编码)。同步提升 extract_frames/extract_audio timeout 至 300 秒。
 
 ---
 
