@@ -1879,19 +1879,14 @@ def handle_chat_message(item: dict, bv: str, comment_type: int,
         print(f"  意图: {intent}")
 
     # 7. 检查是否已经在这个 root 评论下发过总结
-    #    核心规则: 同一个主评论下只发一次总结,后续一律走聊天
+    #    核心规则: Bot在此线程回复过 + 已有视频缓存 → 视为已发过总结,不再重复
+    #    (不用内容相似度判断,因为B站可能拦截/替换回复内容)
     already_posted_summary_in_thread = False
-    if dialog_context:
+    if dialog_context and video_summary_for_reply:
         for msg in dialog_context:
-            if msg.get('role') == 'assistant' and video_summary_for_reply:
-                # 如果Bot之前在这个线程发过的回复和当前总结高度相似(>100字重叠),
-                # 说明已经发过总结了
-                prev_content = msg.get('content', '')
-                if prev_content and len(prev_content) > 50:
-                    # 简单检查: 之前的回复包含总结的关键片段
-                    if video_summary_for_reply[:100] in prev_content or prev_content[:100] in video_summary_for_reply:
-                        already_posted_summary_in_thread = True
-                        break
+            if msg.get('role') == 'assistant':
+                already_posted_summary_in_thread = True
+                break
 
     # 如果已经发过总结但意图仍是 summary,强制转为 chat
     if already_posted_summary_in_thread and intent == "summary":
