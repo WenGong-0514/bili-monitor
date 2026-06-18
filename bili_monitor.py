@@ -1068,7 +1068,8 @@ def download_video(bv: str, output_path: str) -> bool:
 
     if p_count <= 1:
         # 单P视频, 直接下载
-        for fmt in ['30016+30216', 'best']:
+        # 格式链: 30016+30216(旧版合并流) → bestvideo+bestaudio(新版分离流) → best(兜底)
+        for fmt in ['30016+30216', 'bestvideo+bestaudio', 'best']:
             r = subprocess.run([
                 'yt-dlp',
                 '-f', fmt,
@@ -1090,17 +1091,21 @@ def download_video(bv: str, output_path: str) -> bool:
     print(f"  检测到 {p_count} 个分P, 开始逐P下载...", flush=True)
     tmp_dir = os.path.dirname(output_path)
     part_files = []
-    fmt = '30016+30216'
+    # 格式链: 30016+30216(旧版合并流) → bestvideo+bestaudio(新版分离流) → best(兜底)
+    formats_to_try = ['30016+30216', 'bestvideo+bestaudio', 'best']
 
     for i in range(1, p_count + 1):
         part_path = f"{tmp_dir}/part_p{i}.mp4"
         print(f"    下载 P{i}/{p_count}...", flush=True)
-        if not _download_single_p(bv, i, part_path, fmt):
-            # 格式回退
-            if not _download_single_p(bv, i, part_path, 'best'):
-                print(f"    ⚠️ P{i} 下载失败", flush=True)
-                # 已下载的部分仍然可用, 继续合并
+        downloaded = False
+        for fmt in formats_to_try:
+            if _download_single_p(bv, i, part_path, fmt):
+                downloaded = True
                 break
+        if not downloaded:
+            print(f"    ⚠️ P{i} 下载失败", flush=True)
+            # 已下载的部分仍然可用, 继续合并
+            break
         if os.path.exists(part_path):
             part_files.append(part_path)
 
@@ -2193,7 +2198,7 @@ def fetch_reply_messages() -> list:
 
 def main():
     print("=" * 60, flush=True)
-    print(f" B站@消息监控已启动 (v5.5: 分P视频支持 + 首次@必分析 + 结合视频内容对话)", flush=True)
+    print(f" B站@消息监控已启动 (v5.5.1: 新版合集下载修复 + 分P视频支持 + 首次@必分析 + 结合视频内容对话)", flush=True)
     print(f" 轮询间隔: {POLL_INTERVAL}秒", flush=True)
     print(f" 工作目录: {WORK_DIR}", flush=True)
     print(f" 状态文件: {STATE_FILE}", flush=True)
