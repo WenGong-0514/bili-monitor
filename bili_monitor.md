@@ -2,8 +2,8 @@
 
 > ⚠️ **AI Generated Project** — 本项目全部代码由 AI 在人工提示词引导下生成，未经人工审核。使用本项目造成的任何损失与作者无关。完整免责声明见文档末尾。
 >
-> 最后更新: 2026-06-17
-> 版本: v5.5 (分P视频支持: 逐P下载 + 合并)
+> 最后更新: 2026-06-18
+> 版本: v5.5.1 (修复新版合集视频下载失败 + 格式链完善)
 
 ---
 
@@ -26,6 +26,7 @@ B站@消息AI自动监控脚本，常驻后台运行。检测到 `@Bot` 后自�
 | v5.4 | 2026-06-03 | **首次@必做视频分析**,不再因意图分类跳过下载; chat回复强制结合视频内容; 意图分类更严格(模糊消息优先判为summary) |
 | v5.4.3 | 2026-06-14 | **修复视频下载失败**: B站对 `--add-header Cookie` 方式返回 412, 改用 `--cookies` 文件传递 Cookie |
 | v5.5 | 2026-06-17 | **分P视频支持**: 自动检测分P数量, 逐P下载后用 ffmpeg concat 合并为单文件, 确保完整分析 |
+| v5.5.1 | 2026-06-18 | **修复新版合集视频下载失败**: B站新版 anthlogy 格式视频只有分离音视频流, 格式链新增 `bestvideo+bestaudio` 回退, 解决 `30016+30216` 和 `best` 均不可用的问题 |
 
 ## ⚡ 快速启动/停止
 
@@ -587,6 +588,7 @@ B站对评论有自动审核机制，回复发送成功(code=0)后仍可能被�
 - [x] 2026-06-09: **v5.4.1 配置外部化 + GitHub上传支持** — 所有硬编码密钥/参数改为从 config.json 读取。新增 config.example.json 模板。.gitignore 排除 config.json 防止泄露。配置文件支持 --config 参数 / BILI_CONFIG 环境变量 / 同目录 config.json 三级优先。GitHub token 存入 config.json 供上传使用。
 - [x] 2026-06-14: **v5.4.3 视频下载 412 修复** — B站 playinfo API 对 `--add-header Cookie:` 方式返回 HTTP 412 (Precondition Failed), 导致所有视频下载失败、回复均为"视频下载失败"。根因: B站加强反爬, yt-dlp 通过 header 传递 Cookie 时缺少必要的 wbi 签名验证。修复: 改用 `--cookies` Netscape 文件方式传递 Cookie (脚本启动时自动生成 `/tmp/bili_monitor/bili_cookies.txt`)。同时 yt-dlp 从 2026.03.17 更新至 2026.06.09, 增加格式回退逻辑。
 - [x] 2026-06-17: **v5.5 分P视频支持** — 分P视频(如 BV19aVp6dEe7 有2P) 只下载第一P, 导致 ASR 和视觉分析只覆盖小部分内容, GLM-5.1 因信息不足返回"信息不足,无法准确总结"。修复: `download_video()` 新增分P检测, 多P时逐个下载后用 ffmpeg concat demuxer 合并为单文件(concat copy 失败时自动降级重编码)。同步提升 extract_frames/extract_audio timeout 至 300 秒。
+- [x] 2026-06-18: **v5.5.1 新版合集视频下载失败** — B站新版 anthology 格式视频(如 BV1fz421f7tk)只有分离的音视频流, 没有合并格式。格式链 `['30016+30216', 'best']` 均匹配失败, 返回 "Requested format is not available"。修复: 单P和多P下载的格式链均新增 `bestvideo+bestaudio` 作为中间回退, 新版分离流视频自动走 `40028+30280` 等组合下载后合并。
 
 ---
 
