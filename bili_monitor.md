@@ -3,7 +3,7 @@
 > ⚠️ **AI Generated Project** — 本项目全部代码由 AI 在人工提示词引导下生成，未经人工审核。使用本项目造成的任何损失与作者无关。完整免责声明见文档末尾。
 >
 > 最后更新: 2026-06-26
-> 版本: v5.6.0 (ASR 改为本地 SenseVoiceSmall 优先; 云端链作为兜底)
+> 版本: v5.6.1 (QQ 通知改为官方 Bot API 直连; OpenClaw CLI 作为回退)
 > **测试平台迁移**: 2026-06-26 由原 mihomo/clashctl Linux 主机迁移至新 Ubuntu 26.04 主机，改用 systemd user service 部署，详见下方「当前测试平台」。
 > **ASR 模式变更**: 2026-06-26 默认走本地 SenseVoiceSmall + FSMN-VAD (funasr) 推理，云端 qwen3-asr-flash 仅在本地失败/未装 funasr 时降级使用。
 
@@ -84,6 +84,7 @@ WantedBy=default.target
 | v5.5.1 | 2026-06-18 | **修复新版合集视频下载失败**: B站新版 anthlogy 格式视频只有分离音视频流, 格式链新增 `bestvideo+bestaudio` 回退, 解决 `30016+30216` 和 `best` 均不可用的问题 |
 | v5.5.2 | 2026-06-19 | **修复同线程重复发送总结**: B站拦截/替换回复内容后,去重逻辑因内容不匹配失效导致重复发送大段总结。改为基于Bot回复记录的线程级去重(只要在此线程回复过+有缓存,就不再发总结) |
 | v5.6.0 | 2026-06-26 | **ASR 改为本地推理优先**: 默认 `asr.local_first=true` 时, `transcribe_audio()` 先调本地 SenseVoiceSmall + FSMN-VAD (funasr), 成功即返回; 失败/未装 funasr 自动降级到原 qwen3-asr-flash 云端链。模型实例懒加载并跨调用复用, 首次调用 ~5s 加载, 后续 10x+ 实时速度 |
+| v5.6.1 | 2026-06-26 | **QQ 通知官方 Bot 直连**: `notify_qq()` 改为优先用 `channels.qqbot.{appId, clientSecret}` 调官方 Bot API (`getAppAccessToken` → `/v2/users/{openid}/messages`), access_token 缓存到过期前 60s + 401 自动重换。`channels.qqbot` 缺失时仍回退 OpenClaw CLI 兼容老部署。脱离 OpenClaw 环境也能正常推送。 |
 
 ## ⚡ 快速启动/停止
 
@@ -248,13 +249,17 @@ main()  - 15秒循环
 | `ASR_MODEL_CHAIN` | ASR降级链, 从 config.json `asr.model_chain` 读取 |
 | `VISUAL_MODEL_CHAIN` | 视觉模型降级链, 从 config.json `visual.model_chain` 读取 |
 | `MODEL_NAME` | 回复中展示的模型名, 从 config.json `monitor.model_name` 读取 |
-| `QQ_OPENID` | QQ通知目标, 从 config.json `qq.openid` 读取 |
+| `QQ_OPENID` | QQ通知目标 OpenID, 从 `channels.qqbot.openid` 读取 |
+| `QQ_APP_ID` | QQ官方Bot AppID, 从 `channels.qqbot.appId` 读取 |
+| `QQ_CLIENT_SECRET` | QQ官方Bot ClientSecret, 从 `channels.qqbot.clientSecret` 读取 |
 
 ### QQ通知
 
 | 函数 | 说明 |
 |------|------|
-| `notify_qq(text)` | 通过 `openclaw message send` 发QQ消息 |
+| `notify_qq(text)` | 优先用官方Bot API直连(`channels.qqbot` 配置齐全时);缺失时回退到 `openclaw message send` CLI;两者都不可用时静默跳过 |
+| `_get_qq_access_token()` | 用 AppID+ClientSecret 换 access_token, 缓存到过期前 60s, 失效自动重换 |
+| `_qq_split_text(text, max_bytes=1800)` | 按 UTF-8 字节分段, 规避 C2C 单条 ~2000 字节上限 |
 
 ### 状态管理
 
@@ -657,8 +662,9 @@ short_summary_patterns = [
 7. **回复被B站审核折叠(state=17)** — 见下方说明
 8. **2026-06-26 测试平台迁移遗留**: 当前测试主机系统 Python 为 3.14，缺 `requests`/`faster_whisper`，**必须用 venv** `~/asrvenv/bin/python`（Python 3.12.13）；systemd 服务已配好这条路径（用 `%h/asrvenv/...`）。若手动启动忘了用 venv，会立刻 `ModuleNotFoundError: requests`。
 9. **2026-06-26 修复 `MODEL_NAME` 死代码**: 原 `monitor.model_name` 只在 `bili_monitor.py:132` 读取一次后无任何引用，4 处 API payload 硬编码 `"model": "glm-5.1"`。现派生 `TEXT_MODEL = MODEL_NAME.lower()` 并替换所有硬编码点（lines 817/922/1512/1670），改 config 即可切换实际调用的模型。
-10. **2026-06-26 主机无 OpenClaw CLI**: 当前测试平台未安装 `openclaw`，QQ 通知（`notify_qq()`）会失败但不影响主流程；B 站回复照常工作。
+10. **2026-06-26 主机无 OpenClaw CLI → 已切官方 Bot API 直连**: `notify_qq()` 原走 `openclaw message send` 子进程, 测试平台无此 CLI 导致通知一直失败。已改为优先用 `channels.qqbot.{appId, clientSecret}` 直连官方 Bot API(`https://bots.qq.com/app/getAppAccessToken` 换 token, `POST /v2/users/{openid}/messages` 发消息), access_token 缓存到过期前 60s, 401 自动重换。`channels.qqbot` 缺失时仍回退 OpenClaw CLI, 兼容老部署。
 11. **2026-06-26 本地 ASR 首次加载耗时**: 启用 `asr.local_first=true` 后, 第一次识别视频时会下载/加载 SenseVoiceSmall (~5s, 模型缓存在 `~/.cache/modelscope/`), 之后模型常驻内存 ~1.5GB; 后续调用 10x+ 实时速度。若 venv 未装 `funasr`, 自动降级云端链 (日志显示 `[本地ASR] funasr 不可用, 降级云端链`)。
+12. **2026-06-26 QQ 消息分段**: C2C 文本上限约 2000 字节, `_qq_split_text()` 按 UTF-8 字节切分(上限 1800 留余量), 长视频总结会拆成多条按顺序发送, 日志显示 `(i/total)` 进度。
 
 ### B站评论审核折叠 (state=17)
 

@@ -11,8 +11,12 @@
     "dashscope": {
         "api_key": "YOUR_DASHSCOPE_API_KEY_HERE"
     },
-    "qq": {
-        "openid": "YOUR_QQ_OPENID_HERE"
+    "channels": {
+        "qqbot": {
+            "appId": "YOUR_BOT_APPID_HERE",
+            "clientSecret": "YOUR_BOT_CLIENT_SECRET_HERE",
+            "openid": "YOUR_RECIPIENT_OPENID_HERE"
+        }
     },
     "monitor": {
         "poll_interval": 15,

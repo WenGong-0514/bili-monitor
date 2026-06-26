@@ -142,8 +142,13 @@ VISUAL_MODEL_CHAIN = _CFG.get("visual", {}).get("model_chain", [
 MODEL_NAME = _CFG.get("monitor", {}).get("model_name", "GLM-5.1")
 TEXT_MODEL = MODEL_NAME.lower()
 
-# --- QQ通知配置 ---
-QQ_OPENID = _CFG["qq"]["openid"]
+# --- QQ通知配置 (channels.qqbot: 官方 Bot API 直连) ---
+_ch_cfg = _CFG.get("channels", {})
+_qqbot_cfg = _ch_cfg.get("qqbot", {})
+QQ_OPENID = _qqbot_cfg.get("openid", "")
+QQ_APP_ID = _qqbot_cfg.get("appId", "")
+QQ_CLIENT_SECRET = _qqbot_cfg.get("clientSecret", "")
+_QQ_TOKEN_CACHE = {"token": None, "expire_at": 0.0}
 
 # --- 代理配置 ---
 _proxy_cfg = _CFG.get("proxy", {})
@@ -205,7 +210,91 @@ else:
 # QQ 通知
 # ============================================================================
 
+def _get_qq_access_token():
+    """用 AppID+ClientSecret 换 QQ Bot access_token, 缓存到过期前 60s。"""
+    now = time.time()
+    if _QQ_TOKEN_CACHE["token"] and now < _QQ_TOKEN_CACHE["expire_at"] - 60:
+        return _QQ_TOKEN_CACHE["token"]
+    import requests as req
+    try:
+        r = req.post(
+            "https://bots.qq.com/app/getAppAccessToken",
+            json={"appId": QQ_APP_ID, "clientSecret": QQ_CLIENT_SECRET},
+            timeout=10,
+        )
+        r.raise_for_status()
+        data = r.json()
+        token = data.get("access_token")
+        expires_in = float(data.get("expires_in", 7200))
+        if token:
+            _QQ_TOKEN_CACHE["token"] = token
+            _QQ_TOKEN_CACHE["expire_at"] = now + expires_in
+            return token
+        print(f"  ⚠️  QQ access_token 响应异常: {r.text[:200]}")
+    except Exception as e:
+        print(f"  ⚠️  获取 QQ access_token 失败: {e}")
+    return None
+
+
+def _qq_split_text(text: str, max_bytes=1800):
+    """按 UTF-8 字节长度分段(QQ C2C 文本上限 ~2000 字节,留余量)。"""
+    if len(text.encode("utf-8")) <= max_bytes:
+        return [text]
+    chunks, cur = [], ""
+    for ch in text:
+        if len((cur + ch).encode("utf-8")) > max_bytes:
+            chunks.append(cur)
+            cur = ch
+        else:
+            cur += ch
+    if cur:
+        chunks.append(cur)
+    return chunks
+
+
 def notify_qq(text: str):
+    # 优先: 官方 Bot API 直连 (channels.qqbot 配置齐全时)
+    if QQ_APP_ID and QQ_CLIENT_SECRET and QQ_OPENID:
+        import requests as req
+        token = _get_qq_access_token()
+        if not token:
+            return
+        url = f"https://api.sgroup.qq.com/v2/users/{QQ_OPENID}/messages"
+        headers = {
+            "Authorization": f"QQBot {token}",
+            "Content-Type": "application/json",
+        }
+        chunks = _qq_split_text(text)
+        total = len(chunks)
+        for i, chunk in enumerate(chunks):
+            try:
+                r = req.post(url, json={"content": chunk, "msg_type": 0},
+                             headers=headers, timeout=15)
+                if r.status_code in (200, 201, 204):
+                    tag = f" ({i+1}/{total})" if total > 1 else ""
+                    print(f"  📱 QQ通知已发送{tag}")
+                else:
+                    # token 失效时清缓存重试一次
+                    if r.status_code == 401 and i == 0:
+                        _QQ_TOKEN_CACHE["token"] = None
+                        token = _get_qq_access_token()
+                        if token:
+                            headers["Authorization"] = f"QQBot {token}"
+                            r = req.post(url, json={"content": chunk, "msg_type": 0},
+                                         headers=headers, timeout=15)
+                            if r.status_code in (200, 201, 204):
+                                print(f"  📱 QQ通知已发送(token 重试)")
+                                continue
+                    print(f"  ⚠️  QQ通知失败: HTTP {r.status_code} {r.text[:200]}")
+                    break
+            except Exception as e:
+                print(f"  ⚠️  QQ通知异常: {e}")
+                break
+        return
+
+    # 回退: OpenClaw CLI (旧版, 需 openclaw 在 PATH)
+    if not QQ_OPENID:
+        return
     try:
         r = subprocess.run([
             'openclaw', 'message', 'send',
@@ -214,11 +303,11 @@ def notify_qq(text: str):
             '--json'
         ], capture_output=True, text=True, timeout=15)
         if r.returncode == 0 and 'messageId' in r.stdout:
-            print(f"  📱 QQ通知已发送")
+            print(f"  📱 QQ通知已发送(OpenClaw)")
         else:
-            print(f"  ⚠️  QQ通知失败: {r.stdout[:150]}")
+            print(f"  ⚠️  QQ通知失败(OpenClaw): {r.stdout[:150]}")
     except Exception as e:
-        print(f"  ⚠️  QQ通知异常: {e}")
+        print(f"  ⚠️  QQ通知异常(OpenClaw): {e}")
 
 
 # ============================================================================
