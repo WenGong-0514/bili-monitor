@@ -2361,6 +2361,45 @@ def check_unread() -> dict:
     return {'at': data.get('at', 0), 'reply': data.get('reply', 0)}
 
 
+def dry_populate_unread():
+    """启动时把当前 unread 列表全部塞入 state file, 防止历史未读触发雪崩回复。
+
+    场景: 进程被 kill/重启后 state file 可能不完整, B站 unread 列表会持续返回
+    历史消息, 若不预处理则会被当成新消息逐条回复。本函数在启动主循环前调用一次,
+    把现有 unread 的 source_id 全部标记为已知, 之后只处理启动后真正新到的消息。
+
+    安全保证: 只追加不覆盖, 不会丢失既有 state。已读但未清除接口的消息也只会被
+    幂等追加(state 是 set 语义)。
+    """
+    try:
+        at_items = fetch_at_messages()
+        rp_items = fetch_reply_messages()
+    except Exception as e:
+        print(f"  ⚠️  启动 dry-populate 抓取 unread 失败: {e}, 跳过", flush=True)
+        return
+
+    before = len(load_state())
+    new_ids = set()
+    for o in at_items + rp_items:
+        sid = str(o.get('item', {}).get('source_id', ''))
+        if sid:
+            new_ids.add(sid)
+
+    if not new_ids:
+        print(f"  ✓ 启动 dry-populate: unread 为空, 无需标记", flush=True)
+        return
+
+    # 只追加 state 里没有的, 避免重写整个文件
+    existing = load_state()
+    fresh = new_ids - existing
+    if fresh:
+        with open(STATE_FILE, 'a') as f:
+            for sid in sorted(fresh):
+                f.write(sid + '\n')
+    after = len(load_state())
+    print(f"  ✓ 启动 dry-populate: unread 共 {len(new_ids)} 条, 新增标记 {len(fresh)} 条, state: {before} → {after}", flush=True)
+
+
 def fetch_at_messages() -> list:
     d = api_get("https://api.bilibili.com/x/msgfeed/at?build=0&mobi_app=web")
     if d.get('code') != 0:
@@ -2399,6 +2438,11 @@ def main():
     print(f" ASR模型链: {' → '.join(ASR_MODEL_CHAIN)}", flush=True)
     print(f" Bot UID: {BOT_MID}", flush=True)
     print("=" * 60, flush=True)
+    print(flush=True)
+
+    # 启动 dry-populate: 把当前 unread 全部标记为已知, 避免历史消息触发雪崩回复
+    print(f"[{time.strftime('%H:%M:%S')}] 🛡️  启动 dry-populate (跳过历史 unread)...", flush=True)
+    dry_populate_unread()
     print(flush=True)
 
     poll_count = 0
