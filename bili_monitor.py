@@ -128,8 +128,9 @@ VISUAL_MODEL_CHAIN = _CFG.get("visual", {}).get("model_chain", [
     "glm-4v-flash",
 ])
 
-# --- 回复中显示的模型名称(可自定义) ---
+# --- 文本模型: 兼作显示名与 API model ID（自动 lowercase 以匹配智谱接口）---
 MODEL_NAME = _CFG.get("monitor", {}).get("model_name", "GLM-5.1")
+TEXT_MODEL = MODEL_NAME.lower()
 
 # --- QQ通知配置 ---
 QQ_OPENID = _CFG["qq"]["openid"]
@@ -813,7 +814,7 @@ def classify_user_intent(user_message: str, has_video_summary: bool, api_key: st
                 "content-type": "application/json"
             },
             json={
-                "model": "glm-5.1",
+                "model": TEXT_MODEL,
                 "max_tokens": 10,
                 "messages": [{"role": "user", "content": prompt}]
             },
@@ -918,7 +919,7 @@ def generate_chat_reply(
                     "content-type": "application/json"
                 },
                 json={
-                    "model": "glm-5.1",
+                    "model": TEXT_MODEL,
                     "max_tokens": 500,
                     "messages": messages
                 },
@@ -1508,7 +1509,7 @@ def final_summarize(visual_desc: str, asr_text: str, api_key: str) -> str:
                     "content-type": "application/json"
                 },
                 json={
-                    "model": "glm-5.1",
+                    "model": TEXT_MODEL,
                     "max_tokens": 1024,
                     "system": prompt,
                     "messages": [{"role": "user", "content": combined}]
@@ -1522,12 +1523,12 @@ def final_summarize(visual_desc: str, asr_text: str, api_key: str) -> str:
                         return block['text']
             err = data.get('error', {})
             if err:
-                print(f"    GLM-5.1 返回错误(第{attempt+1}次): {err.get('message', str(data))[:100]}", flush=True)
+                print(f"    {MODEL_NAME} 返回错误(第{attempt+1}次): {err.get('message', str(data))[:100]}", flush=True)
         except Exception as e:
-            print(f"    GLM-5.1 异常(第{attempt+1}次): {e}", flush=True)
+            print(f"    {MODEL_NAME} 异常(第{attempt+1}次): {e}", flush=True)
         if attempt < 2:
             time.sleep(2)
-    print(f"    GLM-5.1 连续3次失败,标记为不可用", flush=True)
+    print(f"    {MODEL_NAME} 连续3次失败,标记为不可用", flush=True)
     return "__MODEL_UNAVAILABLE__"
 
 
@@ -1636,8 +1637,8 @@ def process_dynamic(uri: str, subject_id: str, root_id: str, title: str = '',
             time.sleep(0.5)
         image_desc = "\n".join(descriptions)
 
-    # GLM-5.1 总结
-    print(f"  GLM-5.1 总结动态...", flush=True)
+    # GLM 总结
+    print(f"  {MODEL_NAME} 总结动态...", flush=True)
     parts = []
     if text_content:
         parts.append(f"【动态文字内容】\n{text_content[:2000]}")
@@ -1666,7 +1667,7 @@ def process_dynamic(uri: str, subject_id: str, root_id: str, title: str = '',
                     "content-type": "application/json"
                 },
                 json={
-                    "model": "glm-5.1",
+                    "model": TEXT_MODEL,
                     "max_tokens": 500,
                     "system": prompt,
                     "messages": [{"role": "user", "content": combined}]
@@ -1682,7 +1683,7 @@ def process_dynamic(uri: str, subject_id: str, root_id: str, title: str = '',
             if summary != "__MODEL_UNAVAILABLE__":
                 break
         except Exception as e:
-            print(f"    GLM-5.1 异常(第{attempt+1}次): {e}", flush=True)
+            print(f"    {MODEL_NAME} 异常(第{attempt+1}次): {e}", flush=True)
         if attempt < 2:
             time.sleep(2)
 

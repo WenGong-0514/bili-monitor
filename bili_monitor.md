@@ -2,14 +2,68 @@
 
 > ⚠️ **AI Generated Project** — 本项目全部代码由 AI 在人工提示词引导下生成，未经人工审核。使用本项目造成的任何损失与作者无关。完整免责声明见文档末尾。
 >
-> 最后更新: 2026-06-19
+> 最后更新: 2026-06-26
 > 版本: v5.5.2 (修复同线程重复发送总结)
+> **测试平台迁移**: 2026-06-26 由原 mihomo/clashctl Linux 主机迁移至新 Ubuntu 26.04 主机，改用 systemd user service 部署，详见下方「当前测试平台」。
 
 ---
 
 ## 概述
 
 B站@消息AI自动监控脚本，常驻后台运行。检测到 `@Bot` 后自动处理（首次@必做视频分析，后续根据意图回复总结或结合视频内容对话），并通过 QQ Bot 通知用户。
+
+---
+
+## 当前测试平台 (2026-06-26 更新)
+
+| 项 | 值 |
+|---|---|
+| OS | Ubuntu 26.04 LTS (x86_64) |
+| CPU | Intel i5-8350U (4c/8t, AVX2) |
+| 内存 | 3.3 GB（较小，机器同时跑 SenseVoice 本地 ASR 测试） |
+| GPU | 无（VMware SVGA，纯 CPU） |
+| Python | 系统 `python3` = 3.14（缺 ML 库），**必须用 venv** |
+| venv | 在用户家目录自建（Python 3.12 + funasr + requests），路径见下方部署命令 |
+| 工作目录 | git clone 至用户家目录 |
+| 代理 | **未安装** mihomo/clash，脚本启动时探测 7890 端口失败 → 自动走直连（B 站 API 直连可用，已验证 `check_unread()` 110ms 返回） |
+| 守护方式 | **systemd user service**（`bili-monitor.service`，已 enable-linger，重启自动拉起） |
+| 日志 | `/tmp/bili_monitor.log` |
+
+### 部署/管理命令
+
+```bash
+# 假设仓库克隆至 ~/bili-monitor，venv 在 ~/asrvenv
+# 状态
+systemctl --user status bili-monitor
+journalctl --user -u bili-monitor -f          # 实时跟日志
+tail -f /tmp/bili_monitor.log                 # 日志文件
+
+# 控制
+systemctl --user restart bili-monitor         # 重启（改 config 后必须）
+systemctl --user stop bili-monitor
+systemctl --user start bili-monitor
+
+# 服务单元文件位置
+~/.config/systemd/user/bili-monitor.service
+```
+
+服务单元关键配置（路径用 `%h` 占位符表示家目录，避免硬编码用户名）：
+
+```ini
+[Service]
+Type=simple
+WorkingDirectory=%h/bili-monitor
+ExecStart=%h/asrvenv/bin/python -u %h/bili-monitor/bili_monitor.py
+Restart=on-failure
+RestartSec=10
+StandardOutput=append:%t/bili_monitor.log
+StandardError=append:%t/bili_monitor.log
+
+[Install]
+WantedBy=default.target
+```
+
+> 注：原 `nohup` 启动方式仍可用作临时调试，但生产环境统一改用 systemd（详见下方「快速启动/停止」）。
 
 ## 版本历史
 
@@ -31,16 +85,31 @@ B站@消息AI自动监控脚本，常驻后台运行。检测到 `@Bot` 后自�
 
 ## ⚡ 快速启动/停止
 
+### 生产部署（systemd，当前测试平台已采用）
+
 ```bash
 # 首次使用: 复制配置模板并填写真实配置
 cp config.example.json config.json
 nano config.json   # 填写 SESSDATA, bili_jct, API Key 等
 
+# 安放 service 文件后
+systemctl --user daemon-reload
+systemctl --user enable --now bili-monitor.service
+
+# 状态 / 日志 / 重启
+systemctl --user status bili-monitor
+journalctl --user -u bili-monitor -f
+systemctl --user restart bili-monitor
+```
+
+### 临时调试（nohup，原方式）
+
+```bash
+# ⚠️ 当前测试主机系统 Python 为 3.14（无 ML 库），必须用 venv 的 python
+nohup ~/asrvenv/bin/python -u bili_monitor.py >> /tmp/bili_monitor.log 2>&1 &
+
 # 停止
 kill $(pgrep -f bili_monitor.py)
-
-# 启动 (一行搞定)
-nohup python3 -u bili_monitor.py >> /tmp/bili_monitor.log 2>&1 &
 
 # 确认启动成功 (⚠️ 等至少5分钟再看日志！)
 tail -5 /tmp/bili_monitor.log
@@ -63,7 +132,9 @@ tail -5 /tmp/bili_monitor.log
 
 **两种模式都能正常工作。** B站 API 不需要代理也能直接访问。
 
-如果希望走代理(推荐,更稳定), 先启动 mihomo:
+> **当前测试平台**: 未安装代理，启动时自动走直连，已验证 `check_unread()` 110ms 正常返回。
+
+如需启用代理（仅在原 mihomo/clashctl 主机上有效）:
 ```bash
 /etc/init.d/mihomo start   # 或: clashon
 ```
@@ -392,10 +463,12 @@ handle_chat_message()
 | 视频帧分析 | `glm-4.6v-flash` → `glm-4v-flash` | `/api/paas/v4/chat/completions` | 免费(自动降级) |
 | 动态图片分析 | `glm-4.6v-flash` → `glm-4v-flash` | `/api/paas/v4/chat/completions` | 免费(自动降级) |
 | 视频追问(重新查看帧) | `glm-4.6v-flash` → `glm-4v-flash` | `/api/paas/v4/chat/completions` | 免费(自动降级) |
-| 视频总结 | `glm-5.1` | `/api/anthropic/v1/messages` (Anthropic兼容) | 免费 |
-| 意图分类 | `glm-5.1` | `/api/anthropic/v1/messages` | 免费 |
-| 聊天对话 | `glm-5.1` | `/api/anthropic/v1/messages` | 免费 |
+| 视频总结 | `glm-5.2` ✏️ | `/api/anthropic/v1/messages` (Anthropic兼容) | 免费 |
+| 意图分类 | `glm-5.2` ✏️ | `/api/anthropic/v1/messages` | 免费 |
+| 聊天对话 | `glm-5.2` ✏️ | `/api/anthropic/v1/messages` | 免费 |
 | 语音识别 | `qwen3-asr-flash` (多模型降级) | 阿里云百炼 DashScope | 免费(36000次/模型) |
+
+> ✏️ **文本模型 ID 已可配置 (2026-06-26)**: `config.json` 的 `monitor.model_name` 直接决定实际 API 调用的模型 ID——脚本会读取该值、`.lower()` 后传给智谱 Anthropic 接口的 `"model"` 字段。当前测试平台已切到 `GLM-5.2`。改 config 后必须 `systemctl --user restart bili-monitor` 才生效。
 
 ---
 
@@ -460,17 +533,23 @@ handle_chat_message()
 三处视觉调用(帧分析/视频追问/动态图片)统一走 `_call_visual_model()`。
 每个模型最多3次重试, 全部失败才返回空。
 
-### 修改回复模型名
+### 修改回复模型名（同时是实际调用的 model ID）
 
 编辑 `config.json`:
 ```json
 {
     "monitor": {
-        "model_name": "GLM-5.1"
+        "model_name": "GLM-5.2"
     }
 }
 ```
-v5.3: 已不再出现在回复文本中, 仅内部记录。
+
+**2026-06-26 改造**: `MODEL_NAME` 不再是死代码——脚本内部派生 `TEXT_MODEL = MODEL_NAME.lower()`，在 4 处 API payload（意图分类 `classify_user_intent`、聊天 `generate_chat_reply`、视频总结 `final_summarize`、动态总结 `process_dynamic`）中作为 `"model"` 字段使用。所以：
+- 写 `"GLM-5.2"` 或 `"glm-5.2"` 都行（自动 lowercase）
+- 改完必须重启服务：`systemctl --user restart bili-monitor`
+- 日志里的报错消息（`{MODEL_NAME} 返回错误...`）会带上实际模型名
+
+> 历史: v5.3 时为了通过 B 站审核把模型名从回复正文里去掉了，但当时 config 字段误设为「仅显示用」并未真正驱动 API，直到 2026-06-26 才补上。
 
 ### 修改Bot UID (如果换号)
 
@@ -564,6 +643,9 @@ short_summary_patterns = [
 5. **代理已改为自动检测** — 启动时探测7890端口, 有则走代理无则直连, 不再依赖手动启停
 6. **关键帧缓存不自动清理** — `/tmp/bili_monitor/frames_cache_{BV}.json` 会积累，目前没有过期机制
 7. **回复被B站审核折叠(state=17)** — 见下方说明
+8. **2026-06-26 测试平台迁移遗留**: 当前测试主机系统 Python 为 3.14，缺 `requests`/`faster_whisper`，**必须用 venv** `~/asrvenv/bin/python`（Python 3.12.13）；systemd 服务已配好这条路径（用 `%h/asrvenv/...`）。若手动启动忘了用 venv，会立刻 `ModuleNotFoundError: requests`。
+9. **2026-06-26 修复 `MODEL_NAME` 死代码**: 原 `monitor.model_name` 只在 `bili_monitor.py:132` 读取一次后无任何引用，4 处 API payload 硬编码 `"model": "glm-5.1"`。现派生 `TEXT_MODEL = MODEL_NAME.lower()` 并替换所有硬编码点（lines 817/922/1512/1670），改 config 即可切换实际调用的模型。
+10. **2026-06-26 主机无 OpenClaw CLI**: 当前测试平台未安装 `openclaw`，QQ 通知（`notify_qq()`）会失败但不影响主流程；B 站回复照常工作。
 
 ### B站评论审核折叠 (state=17)
 
