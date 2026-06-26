@@ -3,7 +3,7 @@
 > ⚠️ **AI Generated Project** — 本项目全部代码由 AI 在人工提示词引导下生成，未经人工审核。使用本项目造成的任何损失与作者无关。完整免责声明见文档末尾。
 >
 > 最后更新: 2026-06-26
-> 版本: v5.6.2 (启动 dry-populate 防雪崩: 跳过历史 unread 消息)
+> 版本: v5.6.3 (prompt 约束: 回复中不提及 ASR/视觉识别失误)
 > **测试平台迁移**: 2026-06-26 由原 mihomo/clashctl Linux 主机迁移至新 Ubuntu 26.04 主机，改用 systemd user service 部署，详见下方「当前测试平台」。
 > **ASR 模式变更**: 2026-06-26 默认走本地 SenseVoiceSmall + FSMN-VAD (funasr) 推理，云端 qwen3-asr-flash 仅在本地失败/未装 funasr 时降级使用。
 
@@ -86,6 +86,7 @@ WantedBy=default.target
 | v5.6.0 | 2026-06-26 | **ASR 改为本地推理优先**: 默认 `asr.local_first=true` 时, `transcribe_audio()` 先调本地 SenseVoiceSmall + FSMN-VAD (funasr), 成功即返回; 失败/未装 funasr 自动降级到原 qwen3-asr-flash 云端链。模型实例懒加载并跨调用复用, 首次调用 ~5s 加载, 后续 10x+ 实时速度 |
 | v5.6.1 | 2026-06-26 | **QQ 通知官方 Bot 直连**: `notify_qq()` 改为优先用 `channels.qqbot.{appId, clientSecret}` 调官方 Bot API (`getAppAccessToken` → `/v2/users/{openid}/messages`), access_token 缓存到过期前 60s + 401 自动重换。`channels.qqbot` 缺失时仍回退 OpenClaw CLI 兼容老部署。脱离 OpenClaw 环境也能正常推送。 |
 | v5.6.2 | 2026-06-26 | **启动 dry-populate 防雪崩**: `main()` 进入主循环前调 `dry_populate_unread()`, 把当前 unread 列表所有 source_id 追加进 state file。修复: 进程重启或 state file 不完整时, B站 unread API 返回的历史消息会被当成新消息逐条回复 (19:10-19:20 实际事故 8 条雪崩)。只追加不覆盖, 幂等安全。 |
+| v5.6.3 | 2026-06-26 | **prompt 约束: 不提及识别失误**: 视频总结/聊天/动态总结三个 prompt 全部加约束 — 禁止在回复中出现"语音识别"、"字幕机翻"、"识别错误"、"大概是空耳"、"画面分析"等暗示技术过程或识别质量的说法。即使 ASR/视觉明显有误, 也直接当成自己听到/看到的真实内容叙述。修复事故例: "...虽然语音识别的文本跟外语配音混在一起有些字幕机翻般的错乱, 比如'想妈妈'大概率是玩家们被闪光弹白到了疯狂喊'我被闪了/瞎了'的空耳..." |
 
 ## ⚡ 快速启动/停止
 

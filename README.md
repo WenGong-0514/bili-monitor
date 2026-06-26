@@ -18,6 +18,7 @@ B站自动监控脚本：检测到 `@Bot` 后自动下载视频 → 截帧分析
 
 ## 最近更新
 
+- **2026-06-26 (v5.6.3)**: prompt 约束 — 回复中不提及 ASR/视觉识别的失误, 即使识别有误也直接当成自己观察到的内容叙述
 - **2026-06-26 (v5.6.2)**: 启动 dry-populate 防雪崩 — 进入主循环前把 unread 列表全部标记为已知, 防止进程重启/state file 不完整时历史未读被当成新消息挨个回复
 - **2026-06-26 (v5.6.1)**: QQ 通知改为官方 Bot API 直连 — `channels.qqbot.{appId, clientSecret}` 直连, 脱离 OpenClaw 依赖; 老版 CLI 作为回退兼容
 - **2026-06-26 (v5.6.0)**: ASR 改为本地推理优先 — SenseVoiceSmall + FSMN-VAD (funasr), 10x+ 实时速度; 云端链作为兜底
