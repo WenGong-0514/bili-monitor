@@ -18,19 +18,20 @@ B站自动监控脚本：检测到 `@Bot` 后自动下载视频 → 截帧分析
 
 ## 最近更新
 
+- **2026-06-26 (v5.6.1)**: QQ 通知改为官方 Bot API 直连 — `channels.qqbot.{appId, clientSecret}` 直连, 脱离 OpenClaw 依赖; 老版 CLI 作为回退兼容
+- **2026-06-26 (v5.6.0)**: ASR 改为本地推理优先 — SenseVoiceSmall + FSMN-VAD (funasr), 10x+ 实时速度; 云端链作为兜底
 - **2026-06-19 (v5.5.2)**: 修复同线程重复发送总结 — B站拦截回复后去重失效,改为线程级去重
 - **2026-06-18 (v5.5.1)**: 修复新版合集视频下载失败 — 新增 `bestvideo+bestaudio` 格式回退
 - **2026-06-17 (v5.5)**: 分P视频支持 — 自动检测分P数量, 逐P下载后 ffmpeg concat 合并，确保完整分析
 - **2026-06-14 (v5.4.3)**: 修复视频下载失败 — B站对 `--add-header Cookie` 返回 412，改用 `--cookies` 文件方式
-- **2026-06-09 (v5.4.2)**: 回复长度限制放宽 + 审核状态自动检查
-- **2026-06-03 (v5.4)**: 首次@必做视频分析 + chat回复结合视频内容
 
 ## 功能
 
 - 🎬 **视频自动总结** — 首次@自动下载、截帧、ASR识别、GLM总结
 - 💬 **评论区对话** — 结合视频内容智能回复，支持追问视频细节
+- 🎙️ **本地 ASR 优先** — SenseVoiceSmall + FSMN-VAD (funasr), 10x+ 实时速度; 无 funasr 时自动降级到云端
 - 🔄 **多模型降级** — 视觉/语音模型链式降级，免费额度自动切换
-- 📱 **QQ通知** — 处理进度和结果实时推送到QQ
+- 📱 **QQ 通知 (官方 Bot API)** — 处理进度和结果实时推送到 QQ, 不依赖 OpenClaw CLI
 - 🔄 **代理自适应** — 自动检测本地代理，有则走代理无则直连
 - 📋 **动态总结** — 支持B站动态/专栏图文内容分析
 
@@ -39,12 +40,13 @@ B站自动监控脚本：检测到 `@Bot` 后自动下载视频 → 截帧分析
 ```bash
 # 1. 安装依赖
 pip install requests faster-whisper
+# 本地 ASR (可选, 但强烈推荐): pip install funasr torch torchaudio
 apt install ffmpeg
 # 安装 yt-dlp: https://github.com/yt-dlp/yt-dlp
 
 # 2. 配置
 cp config.example.json config.json
-nano config.json  # 填写 B站Cookie、API Key 等
+nano config.json  # 填写 B站Cookie、API Key、QQ Bot 凭据等
 
 # 3. 启动
 nohup python3 -u bili_monitor.py >> /tmp/bili_monitor.log 2>&1 &
@@ -68,7 +70,9 @@ nohup python3 -u bili_monitor.py >> /tmp/bili_monitor.log 2>&1 &
 | `bilibili.bot_mid` | Bot账号的B站UID |
 | `bilibili.bot_name` | Bot在B站的昵称（用于识别@消息） |
 | `zhipu.api_key` | 智谱AI API Key |
-| `qq.openid` | QQ通知目标OpenID |
+| `channels.qqbot.appId` | QQ 官方 Bot AppID |
+| `channels.qqbot.clientSecret` | QQ 官方 Bot ClientSecret |
+| `channels.qqbot.openid` | 接收通知的用户 OpenID |
 
 ### 可选项（有默认值）
 
@@ -77,7 +81,11 @@ nohup python3 -u bili_monitor.py >> /tmp/bili_monitor.log 2>&1 &
 | `dashscope.api_key` | 空 | 阿里云百炼ASR Key（不填则用本地Whisper） |
 | `monitor.poll_interval` | 15 | 轮询间隔（秒） |
 | `proxy.host` / `proxy.port` | 127.0.0.1:7890 | 代理地址 |
-| `asr.model_chain` | qwen3-asr-flash系列 | ASR模型降级链 |
+| `asr.local_first` | true | 优先用本地 SenseVoiceSmall, 失败降级云端 |
+| `asr.local_model` | `iic/SenseVoiceSmall` | 本地 ASR 模型 |
+| `asr.local_vad_model` | `iic/speech_fsmn_vad_...` | 本地 VAD 模型 |
+| `asr.local_threads` | 8 | 本地 ASR 推理线程数 |
+| `asr.model_chain` | qwen3-asr-flash系列 | ASR云端降级链（本地失败时使用） |
 | `visual.model_chain` | glm-4.6v-flash系列 | 视觉模型降级链 |
 
 ## 详细文档
@@ -90,8 +98,9 @@ nohup python3 -u bili_monitor.py >> /tmp/bili_monitor.log 2>&1 &
 - yt-dlp（视频下载）
 - ffmpeg（截帧 + 音频提取）
 - requests（HTTP请求）
-- faster-whisper（本地ASR降级，可选）
-- OpenClaw CLI（QQ消息通知）
+- funasr + torch（本地 ASR 推荐, 缺失时自动降级云端）
+- faster-whisper（最深层级 ASR 兜底，可选）
+- QQ 官方 Bot 账号（[q.qq.com](https://q.qq.com) 申请, 用于通知推送）
 
 ## 许可证
 
