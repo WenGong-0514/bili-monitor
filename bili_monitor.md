@@ -3,8 +3,9 @@
 > ⚠️ **AI Generated Project** — 本项目全部代码由 AI 在人工提示词引导下生成，未经人工审核。使用本项目造成的任何损失与作者无关。完整免责声明见文档末尾。
 >
 > 最后更新: 2026-06-26
-> 版本: v5.5.2 (修复同线程重复发送总结)
+> 版本: v5.6.0 (ASR 改为本地 SenseVoiceSmall 优先; 云端链作为兜底)
 > **测试平台迁移**: 2026-06-26 由原 mihomo/clashctl Linux 主机迁移至新 Ubuntu 26.04 主机，改用 systemd user service 部署，详见下方「当前测试平台」。
+> **ASR 模式变更**: 2026-06-26 默认走本地 SenseVoiceSmall + FSMN-VAD (funasr) 推理，云端 qwen3-asr-flash 仅在本地失败/未装 funasr 时降级使用。
 
 ---
 
@@ -82,6 +83,7 @@ WantedBy=default.target
 | v5.5 | 2026-06-17 | **分P视频支持**: 自动检测分P数量, 逐P下载后用 ffmpeg concat 合并为单文件, 确保完整分析 |
 | v5.5.1 | 2026-06-18 | **修复新版合集视频下载失败**: B站新版 anthlogy 格式视频只有分离音视频流, 格式链新增 `bestvideo+bestaudio` 回退, 解决 `30016+30216` 和 `best` 均不可用的问题 |
 | v5.5.2 | 2026-06-19 | **修复同线程重复发送总结**: B站拦截/替换回复内容后,去重逻辑因内容不匹配失效导致重复发送大段总结。改为基于Bot回复记录的线程级去重(只要在此线程回复过+有缓存,就不再发总结) |
+| v5.6.0 | 2026-06-26 | **ASR 改为本地推理优先**: 默认 `asr.local_first=true` 时, `transcribe_audio()` 先调本地 SenseVoiceSmall + FSMN-VAD (funasr), 成功即返回; 失败/未装 funasr 自动降级到原 qwen3-asr-flash 云端链。模型实例懒加载并跨调用复用, 首次调用 ~5s 加载, 后续 10x+ 实时速度 |
 
 ## ⚡ 快速启动/停止
 
@@ -327,10 +329,11 @@ main()  - 15秒循环
 | 函数 | 说明 |
 |------|------|
 | `get_audio_info(audio_path)` | ffprobe获取音频时长和大小 |
-| `split_audio(audio_path, chunk_dir, duration)` | 超280秒/9MB的音频用ffmpeg分段 |
-| `_do_api_transcribe(audio_path, model)` | 单次云端ASR调用, 返回 (text, status) |
-| `transcribe_local(audio_path, notify)` | 本地faster-whisper medium降级 |
-| `transcribe_audio(audio_path, notify_callback)` | **ASR主流程**: 按模型链尝试, 分段, 降级 |
+| `split_audio(audio_path, chunk_dir, duration)` | 超280秒/9MB的音频用ffmpeg分段 (云端链用) |
+| `_do_local_transcribe_sensevoice(audio_path)` | **v5.6新增** — 本地 SenseVoiceSmall + FSMN-VAD (funasr), 模型懒加载并跨调用复用, 返回 `(text, status)` |
+| `_do_api_transcribe(audio_path, model)` | 单次云端ASR调用 (DashScope), 返回 (text, status) |
+| `transcribe_local(audio_path, notify)` | 本地faster-whisper medium 最终降级 |
+| `transcribe_audio(audio_path, notify_callback)` | **ASR主流程 (v5.6)**: ① 若 `asr.local_first=true` 先调本地 SenseVoice → 成功即返回; ② 否则/失败时走云端模型链; ③ 全失败降级 faster-whisper |
 
 ### 文本总结 (GLM-5.1)
 
@@ -479,7 +482,7 @@ handle_chat_message()
 | 场景 | 链 | 触发条件 |
 |------|-----|---------|
 | 视觉分析 | glm-4.6v-flash → glm-4v-flash | 429限流 / 1305并发过大, 每模型3次重试后切换 |
-| 语音识别 | flash-2026-02-10 → 2025-09-08 → flash → 本地Whisper medium | 免费额度耗尽(quota_exhausted), 每个模型有独立36,000次额度 |
+| 语音识别 (v5.6) | **本地 SenseVoiceSmall** → 云端 flash-2026-02-10 → 2025-09-08 → flash → 本地Whisper medium | 本地失败/未装 funasr → 云端; 云端 quota_exhausted → 下一云端模型; 云端全失败 → Whisper medium |
 | 综合总结 | 无降级(仅 glm-5.1) | 内容不足时直接返回"信息不足"而非编造 |
 
 ---
@@ -505,6 +508,11 @@ handle_chat_message()
 ```json
 {
     "asr": {
+        "local_first": true,
+        "local_model": "iic/SenseVoiceSmall",
+        "local_vad_model": "iic/speech_fsmn_vad_zh-cn-16k-common-pytorch",
+        "local_max_seg_ms": 15000,
+        "local_threads": 8,
         "model_chain": [
             "qwen3-asr-flash-2026-02-10",
             "qwen3-asr-flash-2025-09-08",
@@ -515,7 +523,11 @@ handle_chat_message()
     }
 }
 ```
-每个模型有独立36,000次免费额度, 用完后自动切换下一个。
+- `local_first`: 默认 `true`。`transcribe_audio()` 先调本地 SenseVoiceSmall, 成功即返回; 失败/未装 funasr 自动降级到云端 `model_chain`
+- `local_model` / `local_vad_model`: funasr 的模型 ID (默认从 ModelScope 拉取, 首次联网缓存至 `~/.cache/modelscope/`)
+- `local_max_seg_ms`: VAD 单段最长 15 秒 (避免 SenseVoice 30s 截断)
+- `local_threads`: CPU 推理线程数 (默认 8)
+- 云端 `model_chain` 每个模型有独立 36,000 次免费额度, 仅在本地失败时使用
 
 ### 修改视觉模型降级链
 
@@ -646,6 +658,7 @@ short_summary_patterns = [
 8. **2026-06-26 测试平台迁移遗留**: 当前测试主机系统 Python 为 3.14，缺 `requests`/`faster_whisper`，**必须用 venv** `~/asrvenv/bin/python`（Python 3.12.13）；systemd 服务已配好这条路径（用 `%h/asrvenv/...`）。若手动启动忘了用 venv，会立刻 `ModuleNotFoundError: requests`。
 9. **2026-06-26 修复 `MODEL_NAME` 死代码**: 原 `monitor.model_name` 只在 `bili_monitor.py:132` 读取一次后无任何引用，4 处 API payload 硬编码 `"model": "glm-5.1"`。现派生 `TEXT_MODEL = MODEL_NAME.lower()` 并替换所有硬编码点（lines 817/922/1512/1670），改 config 即可切换实际调用的模型。
 10. **2026-06-26 主机无 OpenClaw CLI**: 当前测试平台未安装 `openclaw`，QQ 通知（`notify_qq()`）会失败但不影响主流程；B 站回复照常工作。
+11. **2026-06-26 本地 ASR 首次加载耗时**: 启用 `asr.local_first=true` 后, 第一次识别视频时会下载/加载 SenseVoiceSmall (~5s, 模型缓存在 `~/.cache/modelscope/`), 之后模型常驻内存 ~1.5GB; 后续调用 10x+ 实时速度。若 venv 未装 `funasr`, 自动降级云端链 (日志显示 `[本地ASR] funasr 不可用, 降级云端链`)。
 
 ### B站评论审核折叠 (state=17)
 

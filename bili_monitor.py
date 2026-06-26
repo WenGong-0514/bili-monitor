@@ -122,6 +122,16 @@ ASR_MODEL_CHAIN = _CFG.get("asr", {}).get("model_chain", [
 ASR_CHUNK_DURATION = _CFG.get("asr", {}).get("chunk_duration", 280)
 ASR_CHUNK_MAX_BYTES = _CFG.get("asr", {}).get("chunk_max_bytes", 9 * 1024 * 1024)
 
+# --- 本地 ASR (SenseVoiceSmall + FSMN-VAD, funasr) ---
+# 默认开启: 本地推理成功就直接返回, 失败/未安装 funasr 再走云端 chain
+_ASR_CFG = _CFG.get("asr", {})
+ASR_LOCAL_FIRST = _ASR_CFG.get("local_first", True)
+ASR_LOCAL_MODEL = _ASR_CFG.get("local_model", "iic/SenseVoiceSmall")
+ASR_LOCAL_VAD_MODEL = _ASR_CFG.get("local_vad_model", "iic/speech_fsmn_vad_zh-cn-16k-common-pytorch")
+ASR_LOCAL_MAX_SEG_MS = int(_ASR_CFG.get("local_max_seg_ms", 15000))
+ASR_LOCAL_THREADS = int(_ASR_CFG.get("local_threads", 8))
+_SENSEVOICE_MODEL = None  # 懒加载, 首次调用 _do_local_transcribe_sensevoice 时初始化
+
 # --- 视觉模型降级链 ---
 VISUAL_MODEL_CHAIN = _CFG.get("visual", {}).get("model_chain", [
     "glm-4.6v-flash",
@@ -1324,6 +1334,76 @@ def split_audio(audio_path: str, chunk_dir: str, chunk_duration: int) -> list:
     return chunks if chunks else [audio_path]
 
 
+def _do_local_transcribe_sensevoice(audio_path: str) -> tuple:
+    """本地 SenseVoiceSmall + FSMN-VAD (funasr).
+
+    返回 (text, status):
+      status="ok"             — 识别成功 (text 可能为空字符串)
+      status="no_funasr"      — venv 未装 funasr, 调用方应降级到云端
+      status="error"          — 真实异常, text 含错误信息
+    """
+    global _SENSEVOICE_MODEL
+    try:
+        import torch
+        from funasr import AutoModel
+    except ImportError as e:
+        return ("", f"no_funasr:{e.__class__.__name__}")
+
+    wav_path = audio_path
+    if not audio_path.lower().endswith('.wav'):
+        wav_path = audio_path.rsplit('.', 1)[0] + '_local16k.wav'
+        r = subprocess.run([
+            'ffmpeg', '-i', audio_path,
+            '-ar', '16000', '-ac', '1',
+            '-y', wav_path
+        ], capture_output=True, text=True, timeout=120)
+        if r.returncode != 0 or not os.path.exists(wav_path):
+            return (f"本地ASR音频预处理失败: {r.stderr[:200]}", "error")
+
+    try:
+        torch.set_num_threads(ASR_LOCAL_THREADS)
+        try:
+            torch.set_num_interop_threads(2)
+        except RuntimeError:
+            pass  # 已设置过, 第二次调用会抛 RuntimeError
+        torch.set_float32_matmul_precision("high")
+        torch.backends.mkldnn.enabled = True
+
+        if _SENSEVOICE_MODEL is None:
+            print(f"    [本地ASR] 首次加载 {ASR_LOCAL_MODEL} (含 VAD {ASR_LOCAL_VAD_MODEL})...", flush=True)
+            _SENSEVOICE_MODEL = AutoModel(
+                model=ASR_LOCAL_MODEL,
+                vad_model=ASR_LOCAL_VAD_MODEL,
+                vad_kwargs={"max_single_segment_time": ASR_LOCAL_MAX_SEG_MS},
+                disable_update=True,
+                device="cpu",
+                disable_pbar=True,
+            )
+
+        res = _SENSEVOICE_MODEL.generate(
+            input=wav_path,
+            cache={},
+            language="auto",
+            use_itn=True,
+            batch_size_s=60,
+        )
+        raw = "".join(
+            r.get("text", "") for r in res
+            if isinstance(r, dict) and r.get("text")
+        )
+        # 去掉 SenseVoice 输出的 <|zh|><|HAPPY|><|BGM|><|withitn|> 等元数据标签
+        text = re.sub(r'<\|[^|]+\|>', '', raw).strip()
+        return (text, "ok")
+    except Exception as e:
+        return (f"本地SenseVoice错误: {e}", "error")
+    finally:
+        if wav_path != audio_path and os.path.exists(wav_path):
+            try:
+                os.remove(wav_path)
+            except OSError:
+                pass
+
+
 def _do_api_transcribe(audio_path: str, model: str) -> tuple:
     import urllib.request as _urllib_request
     with open(audio_path, "rb") as f:
@@ -1400,13 +1480,38 @@ def transcribe_local(audio_path: str, notify=None) -> str:
 
 
 def transcribe_audio(audio_path: str, notify_callback=None) -> str:
+    duration, file_size = get_audio_info(audio_path)
+    print(f"    音频: {duration:.0f}秒, {file_size/1024:.0f}KB", flush=True)
+
+    # 1) 本地 SenseVoice 优先 (默认开启)
+    if ASR_LOCAL_FIRST:
+        print(f"    [本地ASR] SenseVoiceSmall 推理中 (threads={ASR_LOCAL_THREADS}, max_seg={ASR_LOCAL_MAX_SEG_MS}ms)...", flush=True)
+        if notify_callback:
+            notify_callback("🎧 本地ASR (SenseVoiceSmall) 推理中...")
+        t0 = time.time()
+        text, status = _do_local_transcribe_sensevoice(audio_path)
+        dt = time.time() - t0
+        if status == "ok":
+            rtf = (dt / duration) if duration else 0
+            print(f"    [本地ASR] 完成 {dt:.1f}s ({rtf:.2f}x 实时): {text[:200]}{'...' if len(text)>200 else ''}", flush=True)
+            if text:
+                return text
+            print(f"    [本地ASR] 识别为空, 降级云端链", flush=True)
+        elif status == "no_funasr":
+            print(f"    [本地ASR] funasr 不可用, 降级云端链 ({text})", flush=True)
+            if notify_callback:
+                notify_callback("⚠️ 本地ASR未就绪 (funasr未安装), 降级云端")
+        else:
+            print(f"    [本地ASR] 失败, 降级云端链: {text[:200]}", flush=True)
+            if notify_callback:
+                notify_callback(f"⚠️ 本地ASR异常, 降级云端: {text[:80]}")
+
+    # 2) 云端 DashScope chain (兜底)
     if not DASHSCOPE_API_KEY:
         print("  ⚠️  DASHSCOPE_API_KEY未设置,使用本地Whisper(medium)", flush=True)
         if notify_callback:
             notify_callback("⚠️ 未配置云端ASR Key,使用本地Whisper(medium)")
         return transcribe_local(audio_path, notify_callback)
-    duration, file_size = get_audio_info(audio_path)
-    print(f"    音频: {duration:.0f}秒, {file_size/1024:.0f}KB", flush=True)
     needs_split = (duration > ASR_CHUNK_DURATION or file_size > ASR_CHUNK_MAX_BYTES)
     used_models = []
     for model in ASR_MODEL_CHAIN:
