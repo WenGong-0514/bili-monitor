@@ -14,10 +14,11 @@
 
 ---
 
-B站自动监控脚本：检测到 `@Bot` 后自动下载视频 → 截帧分析 + ASR语音识别 → GLM总结 → 评论区回复，同时通过QQ Bot通知。
+B站自动监控脚本：检测到 `@Bot` 后自动下载视频 → 截帧分析 + ASR语音识别 → GLM总结 → 内嵌广告识别 → 评论区回复，同时通过QQ Bot通知。
 
 ## 最近更新
 
+- **2026-08-19 (v5.8.0)**: 内嵌广告识别上线 — 在已下载视频上复用稀疏多帧视觉AI + 30秒时间戳ASR + LLM语义分析 + `blacklist.txt` 黑名单；无广告回复保持原样式，有广告在总结前追加 `检测到xx广告，大约位于mm:ss-mm:ss，跳过空降坐标mm:ss。`
 - **2026-08-19 (v5.7.0)**: 可靠消息轮询 — `unread` 15秒快速检测，@/回复列表每 3600 秒兜底；B站 API 连续超时/风控后自动退避 15 分钟并 QQ 告警；状态、总结、帧缓存、下载文件和日志全部持久化到项目内 `data/`
 
 - **2026-06-26 (v5.6.3)**: prompt 约束 — 回复中不提及 ASR/视觉识别的失误, 即使识别有误也直接当成自己观察到的内容叙述
@@ -32,6 +33,7 @@ B站自动监控脚本：检测到 `@Bot` 后自动下载视频 → 截帧分析
 ## 功能
 
 - 🎬 **视频自动总结** — 首次@自动下载、截帧、ASR识别、GLM总结
+- 🚫 **内嵌广告识别** — 视觉AI多帧联合判断 + 时间戳ASR语义分析 + 商家黑名单，输出广告品牌与空降坐标
 - 💬 **评论区对话** — 结合视频内容智能回复，支持追问视频细节
 - 🎙️ **本地 ASR 优先** — SenseVoiceSmall + FSMN-VAD (funasr), 10x+ 实时速度; 无 funasr 时自动降级到云端
 - 🔄 **多模型降级** — 视觉/语音模型链式降级，免费额度自动切换
@@ -90,6 +92,7 @@ nohup python3 -u bili_monitor.py >> data/logs/bili_monitor.log 2>&1 &
 | `monitor.reply_fallback_interval` | 3600 | 回复消息列表兜底间隔（秒） |
 | `proxy.host` / `proxy.port` | 127.0.0.1:7890 | 代理地址 |
 | `asr.local_first` | true | 优先用本地 SenseVoiceSmall, 失败降级云端 |
+| `ad_detection.enabled` | true | 是否启用内嵌广告识别；详细参数在 `config.yaml`，黑名单在 `blacklist.txt` |
 | `asr.local_model` | `iic/SenseVoiceSmall` | 本地 ASR 模型 |
 | `asr.local_vad_model` | `iic/speech_fsmn_vad_...` | 本地 VAD 模型 |
 | `asr.local_threads` | 8 | 本地 ASR 推理线程数 |

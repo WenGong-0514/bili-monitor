@@ -55,5 +55,8 @@
         "token": "YOUR_GITHUB_TOKEN_HERE",
         "repo": "",
         "note": "token 仅用于项目上传至 GitHub, 不参与脚本运行"
+    },
+    "ad_detection": {
+        "enabled": true
     }
 }

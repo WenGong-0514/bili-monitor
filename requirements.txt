@@ -1,0 +1,4 @@
+requests
+PyYAML
+# 本地广告ASR依赖(可选，但生产环境已安装)
+# funasr torch torchaudio

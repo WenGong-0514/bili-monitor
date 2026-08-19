@@ -48,9 +48,12 @@ if info:
 
 # 2. 处理视频（下载+截帧+ASR+总结）
 print("\n开始处理视频...")
-summary = bili.process_video(BV, notify_callback=bili.notify_qq)
+duration, summary = bili.process_video(BV, notify_callback=bili.notify_qq)
+ad_result = bili.load_ad_result(BV)
 print(f"\n{'='*50}")
+print(f"时长: {duration}")
 print(f"总结: {summary}")
+print(f"广告: {ad_result.get('reply_prefix', '未识别到插入广告')}")
 print(f"{'='*50}")
 
 # 3. 查找该视频的评论区，找到一条主评论回复

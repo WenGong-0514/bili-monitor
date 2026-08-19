@@ -185,6 +185,11 @@ POLL_INTERVAL = _monitor_cfg.get("poll_interval", 15)
 AT_FALLBACK_INTERVAL = _monitor_cfg.get("at_fallback_interval", 3600)
 REPLY_FALLBACK_INTERVAL = _monitor_cfg.get("reply_fallback_interval", 3600)
 
+# --- 内嵌广告识别: 检测参数在 config.yaml, 黑名单在 blacklist.txt ---
+AD_DETECTION_ENABLED = bool(_CFG.get("ad_detection", {}).get("enabled", True))
+AD_RESULTS_DIR = os.path.join(_DATA_DIR, "ad_detection")
+os.makedirs(AD_RESULTS_DIR, exist_ok=True)
+
 for _persistent_file in (STATE_FILE, SUMMARY_FILE, ACTIVE_THREADS_FILE):
     os.makedirs(os.path.dirname(_persistent_file), exist_ok=True)
 os.makedirs(WORK_DIR, exist_ok=True)
@@ -357,13 +362,35 @@ def load_summaries() -> dict:
     except (FileNotFoundError, json.JSONDecodeError):
         return {}
 
-def save_summary(bv: str, summary: str, duration_str: str):
-    """保存一条视频总结"""
+def load_blacklist_keywords() -> list[str]:
+    """读取广告商家黑名单，供启动诊断输出。"""
+    path = os.path.join(_SCRIPT_DIR, "blacklist.txt")
+    try:
+        with open(path, encoding="utf-8") as f:
+            return [x.strip().lower() for x in f if x.strip() and not x.strip().startswith("#")]
+    except (FileNotFoundError, OSError):
+        return []
+
+def load_ad_result(bv: str) -> dict:
+    """加载一个视频的持久化广告检测结果。"""
+    path = os.path.join(AD_RESULTS_DIR, f"{bv}.json")
+    try:
+        with open(path, encoding="utf-8") as f:
+            return json.load(f)
+    except (FileNotFoundError, json.JSONDecodeError, OSError):
+        return {}
+
+def save_summary(bv: str, summary: str, duration_str: str, ad_result: dict | None = None):
+    """保存一条视频总结; 广告前缀单独存储，避免污染后续对话上下文。"""
     summaries = load_summaries()
+    ad_result = ad_result or {}
     summaries[bv] = {
         "summary": summary,
         "duration": duration_str,
-        "time": time.time()
+        "time": time.time(),
+        "ad_prefix": ad_result.get("reply_prefix", ""),
+        "ad_has": bool(ad_result.get("has_ad", False)),
+        "ad_detected_at": ad_result.get("detected_at", 0),
     }
     with open(SUMMARY_FILE, 'w') as f:
         json.dump(summaries, f, ensure_ascii=False, indent=2)
@@ -1945,6 +1972,50 @@ def process_dynamic(uri: str, subject_id: str, root_id: str, title: str = '',
 # 视频处理: 下载+截帧+语音识别+总结
 # ============================================================================
 
+def detect_embedded_ads(bv: str, video_path: str, fallback_duration: int,
+                         notify_callback=None) -> dict:
+    """在已下载的本地视频上执行广告识别；失败不影响原总结流程。"""
+    empty = {
+        "bv": bv, "has_ad": False, "reply_prefix": "",
+        "ads": [], "detected_at": time.time(), "error": ""
+    }
+    if not AD_DETECTION_ENABLED:
+        return empty
+    try:
+        import ad_detector
+        settings, monitor = ad_detector.load_settings()
+        # Reuse the SenseVoice model loaded by summary ASR to avoid double memory.
+        if _SENSEVOICE_MODEL is not None and ad_detector.SHARED_ASR is None:
+            runner = ad_detector.SenseVoiceRunner(settings)
+            runner.model = _SENSEVOICE_MODEL
+            ad_detector.SHARED_ASR = runner
+        try:
+            duration = ad_detector.media_duration(Path(video_path))
+        except Exception:
+            duration = float(fallback_duration)
+        result = ad_detector.detect_local_video(
+            bv, Path(video_path), duration, settings, monitor,
+            Path(AD_RESULTS_DIR)
+        )
+        if result.get("has_ad") and notify_callback:
+            ads = result.get("ads", [])
+            lines = [f"⚠️ 视频识别到 {len(ads)} 段广告", f"BV: {bv}"]
+            for x in ads:
+                lines.append(
+                    f"品牌: {x.get('brand') or '未知'} | "
+                    f"{x.get('start_mmss')}-{x.get('end_mmss')} | "
+                    f"置信度 {float(x.get('confidence', 0)):.2f}"
+                )
+            notify_callback("\n".join(lines))
+        return result
+    except Exception as exc:
+        print(f"  ⚠️ 广告识别失败(不影响总结): {exc}", flush=True)
+        if notify_callback:
+            notify_callback(f"⚠️ 广告识别失败(不影响总结)\nBV: {bv}\n错误: {exc}")
+        empty["error"] = str(exc)
+        return empty
+
+
 def process_video(bv: str, notify_callback=None):
     """
     对一个B站视频执行完整的分析流程。
@@ -1993,6 +2064,10 @@ def process_video(bv: str, notify_callback=None):
 
         print(f"  GLM综合总结...", flush=True)
         summary = final_summarize(visual_desc, asr_text, ZHIPU_API_KEY)
+
+        # 复用刚才下载的视频做广告识别；无广告时最终回复保持原样式。
+        print(f"  内嵌广告识别...", flush=True)
+        ad_result = detect_embedded_ads(bv, video_path, duration, notify_callback)
 
         # 保存关键帧缓存到文件,供后续追问使用
         if frame_cache:
@@ -2096,11 +2171,14 @@ def handle_chat_message(item: dict, bv: str, comment_type: int,
     #   4. 长视频(>6000s) / 官方内容 / 无BV号 仍走原有逻辑
 
     video_summary_for_reply = existing_summary_text if has_existing_summary else ''
+    ad_prefix = video_summary_data.get('ad_prefix', '') if bv else ''
 
     # 5. 首次@: 确保视频已分析 (有BV号且无缓存时必做)
     if bv and not has_existing_summary:
         print(f"  🎬 首次@该视频, 开始视频分析...")
         duration_str, summary = process_video(bv, notify_callback)
+        ad_result = load_ad_result(bv)
+        ad_prefix = ad_result.get('reply_prefix', '')
         print(f"  分析结果: {summary[:100]}...")
 
         if summary == "__MODEL_UNAVAILABLE__":
@@ -2117,7 +2195,7 @@ def handle_chat_message(item: dict, bv: str, comment_type: int,
                 print(f"  ❌ 回复失败: {resp.get('message', '')}")
                 return False, top_root_id
         else:
-            save_summary(bv, summary, duration_str)
+            save_summary(bv, summary, duration_str, ad_result)
             video_summary_for_reply = summary
     elif bv and has_existing_summary:
         print(f"  📋 视频已有缓存, 直接复用总结")
@@ -2151,7 +2229,8 @@ def handle_chat_message(item: dict, bv: str, comment_type: int,
     if intent == "summary":
         # --- 回复总结 ---
         if video_summary_for_reply:
-            reply_text = video_summary_for_reply
+            # 只在总结回复前加广告空降提示；追问/chat保持原交互样式。
+            reply_text = f"{ad_prefix}{video_summary_for_reply}" if ad_prefix else video_summary_for_reply
         else:
             reply_text = "已经帮您总结过了,你可以在之前的评论中查看。"
             print(f"  ⚠️ 视频总结为空,回复提示")
@@ -2484,7 +2563,8 @@ def fetch_reply_messages() -> list:
 
 def main():
     print("=" * 60, flush=True)
-    print(f" B站@消息监控已启动 (v5.7.0: unread快速轮询 + 小时级列表兜底 + API退避 + 项目内持久化)", flush=True)
+    print(f" B站@消息监控已启动 (v5.8.0: unread快速轮询 + 小时级列表兜底 + API退避 + 项目内持久化 + 内嵌广告识别)", flush=True)
+    print(f" 广告识别: {'开启' if AD_DETECTION_ENABLED else '关闭'} | 黑名单: {len(load_blacklist_keywords())}个关键词", flush=True)
     print(f" 轮询间隔: {POLL_INTERVAL}秒 | @列表兜底: {AT_FALLBACK_INTERVAL}秒 | 回复列表兜底: {REPLY_FALLBACK_INTERVAL}秒", flush=True)
     print(f" 工作目录: {WORK_DIR}", flush=True)
     print(f" 状态文件: {STATE_FILE}", flush=True)

@@ -1,0 +1,2 @@
+# One sponsor/merchant keyword per line. Case-insensitive.
+转转

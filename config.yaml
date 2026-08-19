@@ -1,0 +1,21 @@
+monitor_config: config.json
+qq_notify: true
+download:
+  format: bestvideo*+bestaudio/best
+visual:
+  models:
+    - glm-4.6v-flash
+    - glm-4v-flash
+  max_frames: 72
+  window_frames: 5
+  step_frames: 3
+asr:
+  model: iic/SenseVoiceSmall
+  chunk_seconds: 30
+  threads: 6
+text:
+  model: glm-5.2
+detection:
+  min_duration: 20
+  merge_gap: 15
+  single_confidence: 0.78

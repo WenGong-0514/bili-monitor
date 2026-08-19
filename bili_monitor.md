@@ -70,6 +70,7 @@ WantedBy=default.target
 
 | 版本 | 日期 | 主要变更 |
 |------|------|----------|
+| v5.8.0 | 2026-08-19 | **内嵌广告识别**: 复用已下载视频执行稀疏多帧视觉AI + 30秒时间戳ASR + LLM语义分析 + 黑名单判断；结果持久化到 `data/ad_detection/`，有广告时仅在总结回复前追加品牌与空降坐标，无广告保持原回复 |
 | v5.7.0 | 2026-08-19 | **unread 计数不可靠修复**: 保留15秒 unread 快速轮询，@/回复列表每3600秒兜底；API连续超时/风控自动退避15分钟；全部运行文件迁移至项目内 `data/` 持久化 |
 | v1 | 2026-05-08 | 初版: 视频总结 + B站回复 + QQ通知 |
 | v2 | 2026-05-09 | ASR多模型降级链 + 评论区对话 |
@@ -185,6 +186,10 @@ tail -5 data/logs/bili_monitor.log
 | `data/cache/video_summaries.json` | 视频总结缓存。`{bv: {summary, duration, time}}` |
 | `data/state/active_threads.json` | 遗留文件(v2), 当前不再写入, 仅保留读取用于迁移 |
 | `data/work/frames_cache_{BV}.json` | **v4新增** — 视频关键帧base64缓存, 供后续追问使用 |
+| `data/ad_detection/{BV}.json` | **v5.8新增** — 内嵌广告检测结果、置信度、证据与回复前缀 |
+| `data/ad_detection/{BV}.transcript.txt` | **v5.8新增** — 广告识别用30秒时间戳ASR文本 |
+| `config.yaml` | 广告识别模型、抽帧密度、切片长度、置信度等参数 |
+| `blacklist.txt` | 广告商家黑名单，每行一个关键词，当前包含`转转` |
 | `data/work/` | yt-dlp cookies、下载视频、音频、帧等运行期文件 |
 | `data/logs/bili_monitor.log` | systemd/nohup 日志 |
 
@@ -353,6 +358,15 @@ main()  - 15秒循环
 |------|------|
 | `final_summarize(visual_desc, asr_text, api_key)` | 融合视觉描述+语音文本→生成视频总结(含内容质量兜底:视觉+语音均不足则不编造) |
 
+### 内嵌广告识别 (v5.8)
+
+| 函数 | 说明 |
+|------|------|
+| `detect_embedded_ads(bv, video_path, duration, notify)` | 在`process_video()`已下载的本地视频上执行广告识别，失败时只告警不影响总结 |
+| `ad_detector.detect_local_video()` | 稀疏多帧视觉检测 + 30秒时间戳ASR + LLM语义分析 + 黑名单，并持久化结果 |
+| `load_ad_result(bv)` | 读取`data/ad_detection/{BV}.json`，复用已检测视频的结果 |
+| `build_reply_prefix(ads)` | 生成`检测到xx广告，大约位于mm:ss-mm:ss，跳过空降坐标mm:ss。`前缀 |
+
 ### 动态处理
 
 | 函数 | 说明 |
@@ -432,10 +446,11 @@ handle_chat_message()
   │   ├─ cache_frame_b64_list()  →  保存帧base64
   │   ├─ extract_audio()   →  transcribe_audio()
   │   ├─ final_summarize() [GLM-5.1]
+  │   ├─ detect_embedded_ads() [v5.8: 视觉AI + 时间戳ASR + LLM + 黑名单]
   │   └─ dump frames_cache_{BV}.json
-  ├─ save_summary()  →  缓存总结
+  ├─ save_summary()  →  缓存总结与独立广告前缀
   ├─ classify_user_intent()  →  "summary"
-  └─ reply_comment()  →  回复总结 + notify_qq()
+  └─ reply_comment()  →  有广告时先回复空降提示再接总结；无广告保持原总结 + notify_qq()
 ```
 
 ### 路径2: 首次@但意图为 chat — 结合视频内容对话
@@ -468,6 +483,30 @@ handle_chat_message()
   ├─ visual_query_frames()   →  _call_visual_model() 重新查看画面
   └─ generate_chat_reply(visual_context="画面中人物穿着...")  →  回复
 ```
+
+---
+
+## 内嵌广告识别配置 (v5.8)
+
+启用/停用入口在 `config.json`:
+
+```json
+{
+  "ad_detection": {
+    "enabled": true
+  }
+}
+```
+
+详细参数在项目根目录 `config.yaml`:
+
+- `visual.max_frames`: 最多抽帧数量，避免长视频逐帧调用视觉模型
+- `visual.window_frames` / `step_frames`: 多帧联合判断窗口与步长
+- `asr.chunk_seconds`: 广告ASR切片长度，当前30秒
+- `detection.min_duration`: 独立广告段最短时长，当前20秒
+- `detection.single_confidence`: 单模型结果直接采信阈值
+
+黑名单在 `blacklist.txt`，每行一个商家关键词，命中 ASR 或视觉证据时直接判定广告。检测结果持久化在 `data/ad_detection/`，不会重复下载或重复分析已有视频。
 
 ---
 
