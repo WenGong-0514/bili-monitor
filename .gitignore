@@ -8,6 +8,8 @@ __pycache__/
 .venv/
 venv/
 
-# 工作文件
-/tmp/
+# 项目内运行数据（持久化保存，不上传）
 *.log
+data/
+*.bak-*
+*.service.bak-*

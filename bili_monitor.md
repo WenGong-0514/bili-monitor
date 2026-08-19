@@ -2,8 +2,8 @@
 
 > ⚠️ **AI Generated Project** — 本项目全部代码由 AI 在人工提示词引导下生成，未经人工审核。使用本项目造成的任何损失与作者无关。完整免责声明见文档末尾。
 >
-> 最后更新: 2026-06-26
-> 版本: v5.6.3 (prompt 约束: 回复中不提及 ASR/视觉识别失误)
+> 最后更新: 2026-08-19
+> 版本: v5.7.0 (unread快速轮询 + 小时级列表兜底 + API退避 + 项目内持久化)
 > **测试平台迁移**: 2026-06-26 由原 mihomo/clashctl Linux 主机迁移至新 Ubuntu 26.04 主机，改用 systemd user service 部署，详见下方「当前测试平台」。
 > **ASR 模式变更**: 2026-06-26 默认走本地 SenseVoiceSmall + FSMN-VAD (funasr) 推理，云端 qwen3-asr-flash 仅在本地失败/未装 funasr 时降级使用。
 
@@ -28,7 +28,7 @@ B站@消息AI自动监控脚本，常驻后台运行。检测到 `@Bot` 后自�
 | 工作目录 | git clone 至用户家目录 |
 | 代理 | **未安装** mihomo/clash，脚本启动时探测 7890 端口失败 → 自动走直连（B 站 API 直连可用，已验证 `check_unread()` 110ms 返回） |
 | 守护方式 | **systemd user service**（`bili-monitor.service`，已 enable-linger，重启自动拉起） |
-| 日志 | `/tmp/bili_monitor.log` |
+| 日志 | `~/bili-monitor/data/logs/bili_monitor.log` |
 
 ### 部署/管理命令
 
@@ -37,7 +37,7 @@ B站@消息AI自动监控脚本，常驻后台运行。检测到 `@Bot` 后自�
 # 状态
 systemctl --user status bili-monitor
 journalctl --user -u bili-monitor -f          # 实时跟日志
-tail -f /tmp/bili_monitor.log                 # 日志文件
+tail -f data/logs/bili_monitor.log            # 日志文件
 
 # 控制
 systemctl --user restart bili-monitor         # 重启（改 config 后必须）
@@ -57,8 +57,8 @@ WorkingDirectory=%h/bili-monitor
 ExecStart=%h/asrvenv/bin/python -u %h/bili-monitor/bili_monitor.py
 Restart=on-failure
 RestartSec=10
-StandardOutput=append:%t/bili_monitor.log
-StandardError=append:%t/bili_monitor.log
+StandardOutput=append:%h/bili-monitor/data/logs/bili_monitor.log
+StandardError=append:%h/bili-monitor/data/logs/bili_monitor.log
 
 [Install]
 WantedBy=default.target
@@ -70,6 +70,7 @@ WantedBy=default.target
 
 | 版本 | 日期 | 主要变更 |
 |------|------|----------|
+| v5.7.0 | 2026-08-19 | **unread 计数不可靠修复**: 保留15秒 unread 快速轮询，@/回复列表每3600秒兜底；API连续超时/风控自动退避15分钟；全部运行文件迁移至项目内 `data/` 持久化 |
 | v1 | 2026-05-08 | 初版: 视频总结 + B站回复 + QQ通知 |
 | v2 | 2026-05-09 | ASR多模型降级链 + 评论区对话 |
 | v3 | 2026-05-10 | msgfeed统一轮询 + 子评论@处理 |
@@ -111,13 +112,14 @@ systemctl --user restart bili-monitor
 
 ```bash
 # ⚠️ 当前测试主机系统 Python 为 3.14（无 ML 库），必须用 venv 的 python
-nohup ~/asrvenv/bin/python -u bili_monitor.py >> /tmp/bili_monitor.log 2>&1 &
+mkdir -p data/logs
+nohup ~/asrvenv/bin/python -u bili_monitor.py >> data/logs/bili_monitor.log 2>&1 &
 
 # 停止
 kill $(pgrep -f bili_monitor.py)
 
 # 确认启动成功 (⚠️ 等至少5分钟再看日志！)
-tail -5 /tmp/bili_monitor.log
+tail -5 data/logs/bili_monitor.log
 ```
 
 配置文件查找顺序 (优先级从高到低):
@@ -179,10 +181,12 @@ tail -5 /tmp/bili_monitor.log
 
 | 文件 | 说明 |
 |------|------|
-| `/tmp/bili_replied_ids.txt` | 已处理的消息ID。`at` 消息存 `source_id`，`reply` 消息存 `reply_{source_id}` |
-| `/tmp/bili_video_summaries.json` | 视频总结缓存。`{bv: {summary, duration, time}}` |
-| `/tmp/bili_active_threads.json` | 遗留文件(v2), 当前不再写入, 仅保留读取用于迁移 |
-| `/tmp/bili_monitor/frames_cache_{BV}.json` | **v4新增** — 视频关键帧base64缓存, 供后续追问使用 |
+| `data/state/replied_ids.txt` | 已处理的消息ID。`at` 消息存 `source_id`，`reply` 消息存 `reply_{source_id}` |
+| `data/cache/video_summaries.json` | 视频总结缓存。`{bv: {summary, duration, time}}` |
+| `data/state/active_threads.json` | 遗留文件(v2), 当前不再写入, 仅保留读取用于迁移 |
+| `data/work/frames_cache_{BV}.json` | **v4新增** — 视频关键帧base64缓存, 供后续追问使用 |
+| `data/work/` | yt-dlp cookies、下载视频、音频、帧等运行期文件 |
+| `data/logs/bili_monitor.log` | systemd/nohup 日志 |
 
 ---
 
@@ -267,7 +271,7 @@ main()  - 15秒循环
 
 | 函数 | 说明 |
 |------|------|
-| `load_state()` | 读取 `/tmp/bili_replied_ids.txt`，返回已处理ID集合 |
+| `load_state()` | 读取 `data/state/replied_ids.txt`，返回已处理ID集合 |
 | `save_state(source_id)` | 追加一个ID到已处理列表 |
 | `load_summaries()` | 读取视频总结缓存 |
 | `save_summary(bv, summary, duration)` | 保存视频总结 |
@@ -505,7 +509,9 @@ handle_chat_message()
 ```json
 {
     "monitor": {
-        "poll_interval": 15
+        "poll_interval": 15,
+        "at_fallback_interval": 3600,
+        "reply_fallback_interval": 3600
     }
 }
 ```
@@ -598,13 +604,13 @@ curl -s 'https://passport.bilibili.com/x/passport-login/web/qrcode/generate' \
 # 返回 {"data": {"url": "...", "qrcode_key": "xxx"}}
 
 # 2. 将 url 生成二维码图片, 用B站APP扫码确认
-python3 -c "import qrcode; qrcode.make('上面的url').save('/tmp/bili_qr.png')"
+python3 -c "import qrcode; qrcode.make('上面的url').save('data/tmp/bili_qr.png')"
 
 # 3. 轮询确认登录 (替换 qrcode_key)
 curl -s 'https://passport.bilibili.com/x/passport-login/web/qrcode/poll?qrcode_key=<qrcode_key>' \
   -H 'User-Agent: Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36' \
   -H 'Referer: https://www.bilibili.com/' \
-  -D /tmp/bili_headers.txt
+  -D data/tmp/bili_headers.txt
 
 # code=0 表示登录成功, SESSDATA 和 bili_jct 在 set-cookie 响应头中
 # 从 url 参数或 set-cookie 头提取 SESSDATA 和 bili_jct
@@ -661,7 +667,7 @@ short_summary_patterns = [
 3. **100分钟以上视频不处理** — `process_video()` 中硬编码了 `>6000秒` 的限制
 4. **视频下载错误由 yt-dlp 报错** — 如果下载失败频繁，检查 yt-dlp 版本和 cookies 文件是否正确
 5. **代理已改为自动检测** — 启动时探测7890端口, 有则走代理无则直连, 不再依赖手动启停
-6. **关键帧缓存不自动清理** — `/tmp/bili_monitor/frames_cache_{BV}.json` 会积累，目前没有过期机制
+6. **关键帧缓存不自动清理** — `data/work/frames_cache_{BV}.json` 会积累，目前没有过期机制
 7. **回复被B站审核折叠(state=17)** — 见下方说明
 8. **2026-06-26 测试平台迁移遗留**: 当前测试主机系统 Python 为 3.14，缺 `requests`/`faster_whisper`，**必须用 venv** `~/asrvenv/bin/python`（Python 3.12.13）；systemd 服务已配好这条路径（用 `%h/asrvenv/...`）。若手动启动忘了用 venv，会立刻 `ModuleNotFoundError: requests`。
 9. **2026-06-26 修复 `MODEL_NAME` 死代码**: 原 `monitor.model_name` 只在 `bili_monitor.py:132` 读取一次后无任何引用，4 处 API payload 硬编码 `"model": "glm-5.1"`。现派生 `TEXT_MODEL = MODEL_NAME.lower()` 并替换所有硬编码点（lines 817/922/1512/1670），改 config 即可切换实际调用的模型。
@@ -692,7 +698,7 @@ B站对评论有自动审核机制，回复发送成功(code=0)后仍可能被�
 - [x] 2026-06-09: **v5.4.2 回复长度限制放宽 + 审核状态自动检查** — 移除150字截断限制，改为300字以内让AI把内容说完整。新增审核状态自动检查：发送回复后立即检查state字段，如被拦截(state=17)则自动发送抱歉通知；如state=1则45秒后延迟复查确认。审核被拦时用户会收到B站评论区的抱歉消息。
 - [x] 2026-06-03: **v5.4 首次@必做视频分析 + chat回复结合视频内容** — 原逻辑中 chat 意图会跳过视频下载, 导致空对空聊天。用户@了多人但不打算聊天时, 回复内容与语境完全不符。改为: (1)首次@无缓存时无论意图都必做视频分析; (2)chat 回复的 system prompt 强制要求结合视频内容; (3)意图分类 prompt 增加模糊消息优先判为 summary 的原则。
 - [x] 2026-06-09: **v5.4.1 配置外部化 + GitHub上传支持** — 所有硬编码密钥/参数改为从 config.json 读取。新增 config.example.json 模板。.gitignore 排除 config.json 防止泄露。配置文件支持 --config 参数 / BILI_CONFIG 环境变量 / 同目录 config.json 三级优先。GitHub token 存入 config.json 供上传使用。
-- [x] 2026-06-14: **v5.4.3 视频下载 412 修复** — B站 playinfo API 对 `--add-header Cookie:` 方式返回 HTTP 412 (Precondition Failed), 导致所有视频下载失败、回复均为"视频下载失败"。根因: B站加强反爬, yt-dlp 通过 header 传递 Cookie 时缺少必要的 wbi 签名验证。修复: 改用 `--cookies` Netscape 文件方式传递 Cookie (脚本启动时自动生成 `/tmp/bili_monitor/bili_cookies.txt`)。同时 yt-dlp 从 2026.03.17 更新至 2026.06.09, 增加格式回退逻辑。
+- [x] 2026-06-14: **v5.4.3 视频下载 412 修复** — B站 playinfo API 对 `--add-header Cookie:` 方式返回 HTTP 412 (Precondition Failed), 导致所有视频下载失败、回复均为"视频下载失败"。根因: B站加强反爬, yt-dlp 通过 header 传递 Cookie 时缺少必要的 wbi 签名验证。修复: 改用 `--cookies` Netscape 文件方式传递 Cookie (脚本启动时自动生成 `data/work/bili_cookies.txt`（v5.7 前为 `/tmp/bili_monitor/bili_cookies.txt`）)。同时 yt-dlp 从 2026.03.17 更新至 2026.06.09, 增加格式回退逻辑。
 - [x] 2026-06-17: **v5.5 分P视频支持** — 分P视频(如 BV19aVp6dEe7 有2P) 只下载第一P, 导致 ASR 和视觉分析只覆盖小部分内容, GLM-5.1 因信息不足返回"信息不足,无法准确总结"。修复: `download_video()` 新增分P检测, 多P时逐个下载后用 ffmpeg concat demuxer 合并为单文件(concat copy 失败时自动降级重编码)。同步提升 extract_frames/extract_audio timeout 至 300 秒。
 - [x] 2026-06-18: **v5.5.1 新版合集视频下载失败** — B站新版 anthology 格式视频(如 BV1fz421f7tk)只有分离的音视频流, 没有合并格式。格式链 `['30016+30216', 'best']` 均匹配失败, 返回 "Requested format is not available"。修复: 单P和多P下载的格式链均新增 `bestvideo+bestaudio` 作为中间回退, 新版分离流视频自动走 `40028+30280` 等组合下载后合并。
 - [x] 2026-06-19: **v5.5.2 同线程重复发送总结** — B站拦截/替换Bot回复内容后(如 state=18 删除),去重逻辑因内容相似度匹配失效导致子评论@触发时再次发送完整总结。修复: 改为基于Bot回复记录的线程级去重 — 只要在此线程回复过 + 视频已有缓存,就不再重复发总结,后续一律走聊天模式。

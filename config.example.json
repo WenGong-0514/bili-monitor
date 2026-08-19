@@ -20,10 +20,12 @@
     },
     "monitor": {
         "poll_interval": 15,
-        "work_dir": "/tmp/bili_monitor",
-        "state_file": "/tmp/bili_replied_ids.txt",
-        "summary_file": "/tmp/bili_video_summaries.json",
-        "active_threads_file": "/tmp/bili_active_threads.json"
+        "work_dir": "data/work",
+        "state_file": "data/state/replied_ids.txt",
+        "summary_file": "data/cache/video_summaries.json",
+        "active_threads_file": "data/state/active_threads.json",
+        "at_fallback_interval": 3600,
+        "reply_fallback_interval": 3600
     },
     "asr": {
         "local_first": true,

@@ -18,6 +18,8 @@ B站自动监控脚本：检测到 `@Bot` 后自动下载视频 → 截帧分析
 
 ## 最近更新
 
+- **2026-08-19 (v5.7.0)**: 可靠消息轮询 — `unread` 15秒快速检测，@/回复列表每 3600 秒兜底；B站 API 连续超时/风控后自动退避 15 分钟并 QQ 告警；状态、总结、帧缓存、下载文件和日志全部持久化到项目内 `data/`
+
 - **2026-06-26 (v5.6.3)**: prompt 约束 — 回复中不提及 ASR/视觉识别的失误, 即使识别有误也直接当成自己观察到的内容叙述
 - **2026-06-26 (v5.6.2)**: 启动 dry-populate 防雪崩 — 进入主循环前把 unread 列表全部标记为已知, 防止进程重启/state file 不完整时历史未读被当成新消息挨个回复
 - **2026-06-26 (v5.6.1)**: QQ 通知改为官方 Bot API 直连 — `channels.qqbot.{appId, clientSecret}` 直连, 脱离 OpenClaw 依赖; 老版 CLI 作为回退兼容
@@ -35,7 +37,7 @@ B站自动监控脚本：检测到 `@Bot` 后自动下载视频 → 截帧分析
 - 🔄 **多模型降级** — 视觉/语音模型链式降级，免费额度自动切换
 - 📱 **QQ 通知 (官方 Bot API)** — 处理进度和结果实时推送到 QQ, 不依赖 OpenClaw CLI
 - 🔄 **代理自适应** — 自动检测本地代理，有则走代理无则直连
-- 🛡️ **启动防雪崩** — 启动时把 unread 列表标记为已知, 进程重启/state file 不完整也不会重处理历史消息
+- 🛡️ **列表兜底 + API退避** — unread 计数异常时由小时级列表兜底；连续超时/风控自动暂停请求
 - 📋 **动态总结** — 支持B站动态/专栏图文内容分析
 
 ## 快速开始
@@ -52,7 +54,8 @@ cp config.example.json config.json
 nano config.json  # 填写 B站Cookie、API Key、QQ Bot 凭据等
 
 # 3. 启动
-nohup python3 -u bili_monitor.py >> /tmp/bili_monitor.log 2>&1 &
+mkdir -p data/logs
+nohup python3 -u bili_monitor.py >> data/logs/bili_monitor.log 2>&1 &
 ```
 
 ## 配置
@@ -82,7 +85,9 @@ nohup python3 -u bili_monitor.py >> /tmp/bili_monitor.log 2>&1 &
 | 字段 | 默认值 | 说明 |
 |------|--------|------|
 | `dashscope.api_key` | 空 | 阿里云百炼ASR Key（不填则用本地Whisper） |
-| `monitor.poll_interval` | 15 | 轮询间隔（秒） |
+| `monitor.poll_interval` | 15 | `unread` 快速轮询间隔（秒） |
+| `monitor.at_fallback_interval` | 3600 | @消息列表兜底间隔（秒） |
+| `monitor.reply_fallback_interval` | 3600 | 回复消息列表兜底间隔（秒） |
 | `proxy.host` / `proxy.port` | 127.0.0.1:7890 | 代理地址 |
 | `asr.local_first` | true | 优先用本地 SenseVoiceSmall, 失败降级云端 |
 | `asr.local_model` | `iic/SenseVoiceSmall` | 本地 ASR 模型 |

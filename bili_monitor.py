@@ -20,14 +20,14 @@
    - 心跳: 没有新消息时 5 分钟输出一次心跳, 启动后别慌, 等 5 分钟
 
  启动:
-   python3 -u bili_monitor.py >> /tmp/bili_monitor.log 2>&1 &
-   (或使用 nohup: nohup python3 -u bili_monitor.py >> /tmp/bili_monitor.log 2>&1 &)
+   python3 -u bili_monitor.py >> data/logs/bili_monitor.log 2>&1 &
+   (或使用 nohup: nohup python3 -u bili_monitor.py >> data/logs/bili_monitor.log 2>&1 &)
 
  停止:
    kill $(pgrep -f bili_monitor.py)
 
  日志:
-   tail -f /tmp/bili_monitor.log
+   tail -f data/logs/bili_monitor.log
 
  依赖:
    - yt-dlp (视频下载)
@@ -160,14 +160,33 @@ _proxy_port = _proxy_cfg.get("port", 7890)
 # ============================================================================
 
 _monitor_cfg = _CFG.get("monitor", {})
-STATE_FILE         = _monitor_cfg.get("state_file", "/tmp/bili_replied_ids.txt")
-SUMMARY_FILE       = _monitor_cfg.get("summary_file", "/tmp/bili_video_summaries.json")
-ACTIVE_THREADS_FILE = _monitor_cfg.get("active_threads_file", "/tmp/bili_active_threads.json")
-WORK_DIR     = _monitor_cfg.get("work_dir", "/tmp/bili_monitor")
-COOKIES      = f"SESSDATA={SESSDATA}; bili_jct={BILI_JCT}"
-UA           = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
-POLL_INTERVAL = _monitor_cfg.get("poll_interval", 15)
+_SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
+_DATA_DIR = os.path.join(_SCRIPT_DIR, "data")
 
+def _project_path(config_value: str, default_relative: str) -> str:
+    """把配置路径限制在项目目录内，所有运行期文件都持久化保存。"""
+    candidate = Path(config_value or default_relative)
+    if not candidate.is_absolute():
+        candidate = Path(_SCRIPT_DIR) / candidate
+    try:
+        candidate.resolve().relative_to(Path(_SCRIPT_DIR).resolve())
+    except ValueError:
+        print(f"⚠️ 拒绝项目外路径 {config_value!r}, 改用项目内 {default_relative}", flush=True)
+        candidate = Path(_SCRIPT_DIR) / default_relative
+    return str(candidate)
+
+STATE_FILE = _project_path(_monitor_cfg.get("state_file"), "data/state/replied_ids.txt")
+SUMMARY_FILE = _project_path(_monitor_cfg.get("summary_file"), "data/cache/video_summaries.json")
+ACTIVE_THREADS_FILE = _project_path(_monitor_cfg.get("active_threads_file"), "data/state/active_threads.json")
+WORK_DIR = _project_path(_monitor_cfg.get("work_dir"), "data/work")
+COOKIES = f"SESSDATA={SESSDATA}; bili_jct={BILI_JCT}"
+UA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+POLL_INTERVAL = _monitor_cfg.get("poll_interval", 15)
+AT_FALLBACK_INTERVAL = _monitor_cfg.get("at_fallback_interval", 3600)
+REPLY_FALLBACK_INTERVAL = _monitor_cfg.get("reply_fallback_interval", 3600)
+
+for _persistent_file in (STATE_FILE, SUMMARY_FILE, ACTIVE_THREADS_FILE):
+    os.makedirs(os.path.dirname(_persistent_file), exist_ok=True)
 os.makedirs(WORK_DIR, exist_ok=True)
 
 # 生成 yt-dlp 使用的 Netscape cookies 文件
@@ -395,17 +414,57 @@ def save_active_thread(key: str, oid: str, root_rpid: str, comment_type, bv: str
 # B站 API 封装
 # ============================================================================
 
+_API_RISK_CODES = {-412, -799, 429}
+_API_BACKOFF_SECONDS = 15 * 60
+_API_BACKOFF_UNTIL = 0.0
+_api_consecutive_failures = 0
+
+def _record_api_failure(reason: str, detail: str = "") -> dict:
+    """记录连续传输/风控失败；达到阈值后暂停请求并通知。"""
+    global _api_consecutive_failures, _API_BACKOFF_UNTIL
+    if time.time() < _API_BACKOFF_UNTIL:
+        return {"code": -429, "message": "API backoff active"}
+    _api_consecutive_failures += 1
+    message = f"{reason}{(': ' + detail) if detail else ''}"
+    if _api_consecutive_failures >= 3:
+        _API_BACKOFF_UNTIL = time.time() + _API_BACKOFF_SECONDS
+        _api_consecutive_failures = 0
+        print(f"[{time.strftime('%H:%M:%S')}] 🛡️ B站API连续异常，暂停请求{_API_BACKOFF_SECONDS}秒: {message}", flush=True)
+        try:
+            notify_qq(f"⚠️ bili-monitor进入API退避\n原因: {message}\n暂停: {_API_BACKOFF_SECONDS}秒")
+        except Exception:
+            pass
+    return {"code": -1, "message": message}
+
+def _curl_json(args: list) -> dict:
+    global _api_consecutive_failures
+    if time.time() < _API_BACKOFF_UNTIL:
+        return {"code": -429, "message": "API backoff active"}
+    try:
+        r = subprocess.run(args, capture_output=True, text=True, timeout=15)
+    except subprocess.TimeoutExpired as e:
+        return _record_api_failure("请求超时", str(e))
+    except Exception as e:
+        return _record_api_failure("请求失败", str(e))
+    try:
+        result = json.loads(r.stdout)
+    except json.JSONDecodeError:
+        return _record_api_failure("响应不是JSON", r.stdout[:120])
+    code = result.get("code")
+    if code == 0:
+        _api_consecutive_failures = 0
+        return result
+    if code in _API_RISK_CODES:
+        return _record_api_failure(f"B站风控/限流 code={code}", result.get("message", ""))
+    return result
+
 def api_get(url: str) -> dict:
-    r = subprocess.run([
+    return _curl_json([
         'curl', '-s', url,
         '-H', f'User-Agent: {UA}',
         '-H', 'Referer: https://www.bilibili.com/',
         '-H', f'Cookie: {COOKIES}'
-    ], capture_output=True, text=True, timeout=15)
-    try:
-        return json.loads(r.stdout)
-    except json.JSONDecodeError:
-        return {"code": -1, "message": "JSON parse error"}
+    ])
 
 def api_post_form(url: str, data: dict) -> dict:
     args = [
@@ -417,11 +476,7 @@ def api_post_form(url: str, data: dict) -> dict:
     ]
     for k, v in data.items():
         args += ['--data-urlencode', f'{k}={v}']
-    r = subprocess.run(args, capture_output=True, text=True, timeout=15)
-    try:
-        return json.loads(r.stdout)
-    except json.JSONDecodeError:
-        return {"code": -1, "message": "JSON parse error"}
+    return _curl_json(args)
 
 
 # ============================================================================
@@ -2429,8 +2484,8 @@ def fetch_reply_messages() -> list:
 
 def main():
     print("=" * 60, flush=True)
-    print(f" B站@消息监控已启动 (v5.5.1: 新版合集下载修复 + 分P视频支持 + 首次@必分析 + 结合视频内容对话)", flush=True)
-    print(f" 轮询间隔: {POLL_INTERVAL}秒", flush=True)
+    print(f" B站@消息监控已启动 (v5.7.0: unread快速轮询 + 小时级列表兜底 + API退避 + 项目内持久化)", flush=True)
+    print(f" 轮询间隔: {POLL_INTERVAL}秒 | @列表兜底: {AT_FALLBACK_INTERVAL}秒 | 回复列表兜底: {REPLY_FALLBACK_INTERVAL}秒", flush=True)
     print(f" 工作目录: {WORK_DIR}", flush=True)
     print(f" 状态文件: {STATE_FILE}", flush=True)
     print(f" 总结缓存: {SUMMARY_FILE}", flush=True)
@@ -2442,46 +2497,65 @@ def main():
     print("=" * 60, flush=True)
     print(flush=True)
 
-    # 启动 dry-populate: 把当前 unread 全部标记为已知, 避免历史消息触发雪崩回复
-    print(f"[{time.strftime('%H:%M:%S')}] 🛡️  启动 dry-populate (跳过历史 unread)...", flush=True)
-    dry_populate_unread()
-    print(flush=True)
-
+    # 启动时不做 dry-populate：它会吞掉 unread 计数异常导致漏处理的消息。
+    # 列表兜底从启动后一个周期开始，避免重启后集中补发历史消息。
     poll_count = 0
     HEARTBEAT_EVERY = 20
     SUCCESSIVE_ERRORS_MAX = 3
     successive_errors = 0
+    next_at_fallback = time.monotonic() + AT_FALLBACK_INTERVAL
+    next_reply_fallback = time.monotonic() + REPLY_FALLBACK_INTERVAL
 
     while True:
         try:
+            # API退避期间不做高频重试，最多每60秒记录一次状态
+            remaining_backoff = _API_BACKOFF_UNTIL - time.time()
+            if remaining_backoff > 0:
+                poll_count += 1
+                if poll_count % HEARTBEAT_EVERY == 0:
+                    print(f"[{time.strftime('%H:%M:%S')}] 🛡️ API退避中，剩余{int(remaining_backoff)}秒", flush=True)
+                time.sleep(min(60, remaining_backoff + 1))
+                continue
+
             unread = check_unread()
             poll_count += 1
 
             if unread is None:
                 successive_errors += 1
                 if successive_errors <= SUCCESSIVE_ERRORS_MAX:
-                    print(f"[{time.strftime('%H:%M:%S')}] ⚠️  unread接口异常 (连续{successive_errors}次)", flush=True)
+                    print(f"[{time.strftime('%H:%M:%S')}] ⚠️ unread接口异常 (连续{successive_errors}次)", flush=True)
                 elif successive_errors == SUCCESSIVE_ERRORS_MAX + 1:
-                    print(f"[{time.strftime('%H:%M:%S')}] ⚠️  持续异常,之后每20次只告警一次", flush=True)
+                    print(f"[{time.strftime('%H:%M:%S')}] ⚠️ 持续异常,之后每20次只告警一次", flush=True)
             else:
                 successive_errors = 0
                 at_count = unread.get('at', 0)
                 reply_count = unread.get('reply', 0)
 
-                # 处理@消息
+                # unread 是15秒快速通道
                 if at_count > 0:
-                    print(f"\n[{time.strftime('%H:%M:%S')}] 📬 检测到 {at_count} 条新@消息,开始处理...")
+                    print(f"\n[{time.strftime('%H:%M:%S')}] 📬 unread检测到 {at_count} 条新@消息,开始处理...")
                     process_new_at_messages()
+                    next_at_fallback = time.monotonic() + AT_FALLBACK_INTERVAL
+                elif time.monotonic() >= next_at_fallback:
+                    print(f"\n[{time.strftime('%H:%M:%S')}] 🔄 unread.at=0，执行@列表小时级兜底...")
+                    process_new_at_messages()
+                    next_at_fallback = time.monotonic() + AT_FALLBACK_INTERVAL
 
-                # 处理回复通知(子评论中的@Bot)
                 if reply_count > 0:
-                    print(f"\n[{time.strftime('%H:%M:%S')}] 💬 检测到 {reply_count} 条新回复,开始处理...")
+                    print(f"\n[{time.strftime('%H:%M:%S')}] 💬 unread检测到 {reply_count} 条新回复,开始处理...")
                     process_new_reply_messages()
+                    next_reply_fallback = time.monotonic() + REPLY_FALLBACK_INTERVAL
+                elif time.monotonic() >= next_reply_fallback:
+                    print(f"\n[{time.strftime('%H:%M:%S')}] 🔄 unread.reply=0，执行回复列表小时级兜底...")
+                    process_new_reply_messages()
+                    next_reply_fallback = time.monotonic() + REPLY_FALLBACK_INTERVAL
 
                 # 心跳日志
                 if at_count == 0 and reply_count == 0:
                     if poll_count % HEARTBEAT_EVERY == 0:
-                        print(f"[{time.strftime('%H:%M:%S')}] 💓 心跳 #{poll_count} | unread.at=0 reply=0 | 正常", flush=True)
+                        next_at = max(0, int(next_at_fallback - time.monotonic()))
+                        next_reply = max(0, int(next_reply_fallback - time.monotonic()))
+                        print(f"[{time.strftime('%H:%M:%S')}] 💓 心跳 #{poll_count} | unread.at=0 reply=0 | @兜底{next_at}s 回复兜底{next_reply}s", flush=True)
 
         except Exception as e:
             print(f"[{time.strftime('%H:%M:%S')}] ❌ 处理异常: {e}")
