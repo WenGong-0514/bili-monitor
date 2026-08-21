@@ -36,8 +36,8 @@ B站自动监控脚本：检测到 `@Bot` 后自动下载视频 → 截帧分析
 - 🎬 **视频自动总结** — 首次@自动下载、截帧、ASR识别、GLM总结
 - 🚫 **内嵌广告识别** — 视觉AI多帧联合判断 + 时间戳ASR语义分析 + 商家黑名单，输出广告品牌与空降坐标
 - 💬 **评论区对话** — 结合视频内容智能回复，支持追问视频细节
-- 🎙️ **本地 ASR 优先** — SenseVoiceSmall + FSMN-VAD (funasr), 10x+ 实时速度; 无 funasr 时自动降级到云端
-- 🔄 **多模型降级** — 视觉/语音模型链式降级，免费额度自动切换
+- 🎙️ **本地 ASR 唯一路径** — SenseVoiceSmall + FSMN-VAD (funasr), 10x+ 实时速度; 在线 ASR 已全部过期下线, 不再走云端
+- 🔄 **多模型降级** — 视觉模型链式降级 + 文本模型 GLM→DeepSeek V4 Pro 降级
 - 📱 **QQ 通知 (官方 Bot API)** — 处理进度和结果实时推送到 QQ, 不依赖 OpenClaw CLI
 - 🔄 **代理自适应** — 自动检测本地代理，有则走代理无则直连
 - 🛡️ **列表兜底 + API退避** — unread 计数异常时由小时级列表兜底；连续超时/风控自动暂停请求
@@ -47,8 +47,8 @@ B站自动监控脚本：检测到 `@Bot` 后自动下载视频 → 截帧分析
 
 ```bash
 # 1. 安装依赖
-pip install requests faster-whisper
-# 本地 ASR (可选, 但强烈推荐): pip install funasr torch torchaudio
+pip install requests funasr torch torchaudio
+# 可选本地兜底: pip install faster-whisper
 apt install ffmpeg
 # 安装 yt-dlp: https://github.com/yt-dlp/yt-dlp
 
@@ -111,17 +111,15 @@ docker compose logs -f   # 查看启动横幅与轮询日志
 
 | 字段 | 默认值 | 说明 |
 |------|--------|------|
-| `dashscope.api_key` | 空 | 阿里云百炼ASR Key（不填则用本地Whisper） |
 | `monitor.poll_interval` | 15 | `unread` 快速轮询间隔（秒） |
 | `monitor.at_fallback_interval` | 3600 | @消息列表兜底间隔（秒） |
 | `monitor.reply_fallback_interval` | 3600 | 回复消息列表兜底间隔（秒） |
 | `proxy.host` / `proxy.port` | 127.0.0.1:7890 | 代理地址 |
-| `asr.local_first` | true | 优先用本地 SenseVoiceSmall, 失败降级云端 |
+| `asr.local_first` | true | 本地 SenseVoiceSmall 唯一路径（在线 ASR 已下线） |
 | `ad_detection.enabled` | true | 是否启用内嵌广告识别；详细参数在 `config.yaml`，黑名单在 `blacklist.txt` |
 | `asr.local_model` | `iic/SenseVoiceSmall` | 本地 ASR 模型 |
 | `asr.local_vad_model` | `iic/speech_fsmn_vad_...` | 本地 VAD 模型 |
 | `asr.local_threads` | 8 | 本地 ASR 推理线程数 |
-| `asr.model_chain` | qwen3-asr-flash系列 | ASR云端降级链（本地失败时使用） |
 | `visual.model_chain` | glm-4.6v-flash系列 | 视觉模型降级链 |
 | `deepseek.api_key` | 空 | DeepSeek V4 Pro 降级链密钥（GLM 不可用时自动切换，OpenAI 兼容） |
 
@@ -135,8 +133,8 @@ docker compose logs -f   # 查看启动横幅与轮询日志
 - yt-dlp（视频下载）
 - ffmpeg（截帧 + 音频提取）
 - requests（HTTP请求）
-- funasr + torch（本地 ASR 推荐, 缺失时自动降级云端）
-- faster-whisper（最深层级 ASR 兜底，可选）
+- funasr + torch（本地 ASR, 唯一路径）
+- faster-whisper（本地 ASR 兜底，可选）
 - QQ 官方 Bot 账号（[q.qq.com](https://q.qq.com) 申请, 用于通知推送）
 
 ## 许可证

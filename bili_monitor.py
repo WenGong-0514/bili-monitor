@@ -111,19 +111,8 @@ BOT_NAME = _CFG["bilibili"].get("bot_name", "")  # Bot在B站的昵称, 用于�
 # --- 智谱AI API ---
 ZHIPU_API_KEY = _CFG["zhipu"]["api_key"]
 
-# --- 阿里云百炼 (语音识别) ---
-# 优先使用配置文件中的key, 兼容旧的环境变量方式
-DASHSCOPE_API_KEY = _CFG.get("dashscope", {}).get("api_key", "") or os.environ.get("DASHSCOPE_API_KEY", "")
-ASR_MODEL_CHAIN = _CFG.get("asr", {}).get("model_chain", [
-    "qwen3-asr-flash-2026-02-10",
-    "qwen3-asr-flash-2025-09-08",
-    "qwen3-asr-flash",
-])
-ASR_CHUNK_DURATION = _CFG.get("asr", {}).get("chunk_duration", 280)
-ASR_CHUNK_MAX_BYTES = _CFG.get("asr", {}).get("chunk_max_bytes", 9 * 1024 * 1024)
-
 # --- 本地 ASR (SenseVoiceSmall + FSMN-VAD, funasr) ---
-# 默认开启: 本地推理成功就直接返回, 失败/未安装 funasr 再走云端 chain
+# 唯一 ASR 路径: 本地推理。在线 ASR 已全部过期下线, 不再配置云端降级链。
 _ASR_CFG = _CFG.get("asr", {})
 ASR_LOCAL_FIRST = _ASR_CFG.get("local_first", True)
 ASR_LOCAL_MODEL = _ASR_CFG.get("local_model", "iic/SenseVoiceSmall")
@@ -1529,18 +1518,6 @@ def get_audio_info(audio_path: str):
         return 0, os.path.getsize(audio_path)
 
 
-def split_audio(audio_path: str, chunk_dir: str, chunk_duration: int) -> list:
-    os.makedirs(chunk_dir, exist_ok=True)
-    subprocess.run([
-        'ffmpeg', '-i', audio_path,
-        '-f', 'segment', '-segment_time', str(chunk_duration),
-        '-c:a', 'libmp3lame', '-q:a', '4',
-        '-y', f'{chunk_dir}/chunk_%03d.mp3'
-    ], capture_output=True, text=True, timeout=120)
-    chunks = sorted(glob.glob(f'{chunk_dir}/chunk_*.mp3'))
-    return chunks if chunks else [audio_path]
-
-
 def _do_local_transcribe_sensevoice(audio_path: str) -> tuple:
     """本地 SenseVoiceSmall + FSMN-VAD (funasr).
 
@@ -1611,60 +1588,11 @@ def _do_local_transcribe_sensevoice(audio_path: str) -> tuple:
                 pass
 
 
-def _do_api_transcribe(audio_path: str, model: str) -> tuple:
-    import urllib.request as _urllib_request
-    with open(audio_path, "rb") as f:
-        audio_bytes = f.read()
-    audio_b64 = base64.b64encode(audio_bytes).decode()
-    ext = os.path.splitext(audio_path)[1].lower()
-    mime_map = {'.mp3': 'audio/mp3', '.wav': 'audio/wav', '.m4a': 'audio/mp4', '.ogg': 'audio/ogg'}
-    mime = mime_map.get(ext, 'audio/mp3')
-    data = {
-        "model": model,
-        "input": {
-            "messages": [{
-                "role": "user",
-                "content": [{"type": "audio", "audio": f"data:{mime};base64,{audio_b64}"}]
-            }]
-        },
-        "parameters": {"language": "zh"}
-    }
-    req = _urllib_request.Request(
-        "https://dashscope.aliyuncs.com/api/v1/services/aigc/multimodal-generation/generation",
-        data=json.dumps(data).encode(),
-        headers={
-            "Authorization": f"Bearer {DASHSCOPE_API_KEY}",
-            "Content-Type": "application/json"
-        }
-    )
-    try:
-        with _urllib_request.urlopen(req, timeout=120) as resp:
-            result = json.loads(resp.read())
-        choices = result.get("output", {}).get("choices", [])
-        if choices:
-            content = choices[0].get("message", {}).get("content", [])
-            texts = [c.get("text", "").strip() for c in content if c.get("text", "").strip()]
-            if texts:
-                return ("\n".join(texts), "ok")
-        return ("", "ok")
-    except Exception as e:
-        err_str = str(e)
-        error_body = ""
-        if hasattr(e, 'read'):
-            try:
-                error_body = e.read().decode()[:1000]
-            except Exception:
-                pass
-        if "403" in err_str or "FreeTierOnly" in error_body or "AllocationQuota" in error_body:
-            return ("", "quota_exhausted")
-        return (f"API错误({model}): {err_str[:150]}", "error")
-
-
 def transcribe_local(audio_path: str, notify=None) -> str:
     try:
         from faster_whisper import WhisperModel
         if notify:
-            notify("🐌 云端ASR额度已用尽,切换本地Whisper(medium),处理速度较慢请耐心等待...")
+            notify("🐌 本地SenseVoice不可用,切换本地Whisper(medium),处理速度较慢请耐心等待...")
         print(f"    本地Whisper(medium)识别中...", flush=True)
         wav_path = audio_path
         if not audio_path.endswith('.wav'):
@@ -1690,88 +1618,28 @@ def transcribe_audio(audio_path: str, notify_callback=None) -> str:
     duration, file_size = get_audio_info(audio_path)
     print(f"    音频: {duration:.0f}秒, {file_size/1024:.0f}KB", flush=True)
 
-    # 1) 本地 SenseVoice 优先 (默认开启)
-    if ASR_LOCAL_FIRST:
-        print(f"    [本地ASR] SenseVoiceSmall 推理中 (threads={ASR_LOCAL_THREADS}, max_seg={ASR_LOCAL_MAX_SEG_MS}ms)...", flush=True)
-        if notify_callback:
-            notify_callback("🎧 本地ASR (SenseVoiceSmall) 推理中...")
-        t0 = time.time()
-        text, status = _do_local_transcribe_sensevoice(audio_path)
-        dt = time.time() - t0
-        if status == "ok":
-            rtf = (dt / duration) if duration else 0
-            print(f"    [本地ASR] 完成 {dt:.1f}s ({rtf:.2f}x 实时): {text[:200]}{'...' if len(text)>200 else ''}", flush=True)
-            if text:
-                return text
-            print(f"    [本地ASR] 识别为空, 降级云端链", flush=True)
-        elif status == "no_funasr":
-            print(f"    [本地ASR] funasr 不可用, 降级云端链 ({text})", flush=True)
-            if notify_callback:
-                notify_callback("⚠️ 本地ASR未就绪 (funasr未安装), 降级云端")
-        else:
-            print(f"    [本地ASR] 失败, 降级云端链: {text[:200]}", flush=True)
-            if notify_callback:
-                notify_callback(f"⚠️ 本地ASR异常, 降级云端: {text[:80]}")
-
-    # 2) 云端 DashScope chain (兜底)
-    if not DASHSCOPE_API_KEY:
-        print("  ⚠️  DASHSCOPE_API_KEY未设置,使用本地Whisper(medium)", flush=True)
-        if notify_callback:
-            notify_callback("⚠️ 未配置云端ASR Key,使用本地Whisper(medium)")
-        return transcribe_local(audio_path, notify_callback)
-    needs_split = (duration > ASR_CHUNK_DURATION or file_size > ASR_CHUNK_MAX_BYTES)
-    used_models = []
-    for model in ASR_MODEL_CHAIN:
-        chunk_dir = f"{os.path.dirname(audio_path)}/chunks_{model.replace('.', '_')}"
-        if needs_split:
-            chunks = split_audio(audio_path, chunk_dir, ASR_CHUNK_DURATION)
-            print(f"    模型 {model} | {len(chunks)}段并行识别...", flush=True)
-        else:
-            chunks = [audio_path]
-            print(f"    模型 {model} | 单段识别...", flush=True)
-        texts = []
-        quota_exhausted = False
-        for i, chunk_path in enumerate(chunks):
-            if len(chunks) > 1:
-                print(f"      分段{i+1}/{len(chunks)} ({os.path.getsize(chunk_path)/1024:.0f}KB)...", flush=True)
-            result, status = _do_api_transcribe(chunk_path, model)
-            if status == "quota_exhausted":
-                quota_exhausted = True
-                used_models.append(model)
-                print(f"      ⚠️  {model} 免费额度已用尽,切换下一模型", flush=True)
-                if notify_callback:
-                    notify_callback(f"🔄 ASR模型 {model} 免费额度已用尽,自动切换下一个模型")
-                break
-            elif status == "error":
-                print(f"      ⚠️  {result}", flush=True)
-                texts.append(result)
-            else:
-                print(f"      [ASR原始] {result[:200]}{'...' if len(result)>200 else ''}", flush=True)
-                texts.append(result)
-        if needs_split and os.path.exists(chunk_dir):
-            subprocess.run(['rm', '-rf', chunk_dir], timeout=10)
-        if quota_exhausted:
-            continue
-        if texts:
-            valid = [t for t in texts if t and not t.startswith("API错误")]
-            if valid:
-                return "\n".join(valid)
-            if texts:
-                return texts[0]
-        return ""
-    print(f"    已尝试: {used_models},降级本地Whisper(medium)", flush=True)
+    # 唯一 ASR 路径: 本地 SenseVoice 推理 (在线 ASR 已全部过期下线)
+    print(f"    [本地ASR] SenseVoiceSmall 推理中 (threads={ASR_LOCAL_THREADS}, max_seg={ASR_LOCAL_MAX_SEG_MS}ms)...", flush=True)
     if notify_callback:
-        notify_callback(
-            f"⚠️ 所有云端ASR免费额度已用尽\n"
-            f"已尝试: {', '.join(used_models)}\n"
-            f"降级到本地Whisper(medium),处理速度较慢"
-        )
+        notify_callback("🎧 本地ASR (SenseVoiceSmall) 推理中...")
+    t0 = time.time()
+    text, status = _do_local_transcribe_sensevoice(audio_path)
+    dt = time.time() - t0
+    if status == "ok" and text:
+        rtf = (dt / duration) if duration else 0
+        print(f"    [本地ASR] 完成 {dt:.1f}s ({rtf:.2f}x 实时): {text[:200]}{'...' if len(text)>200 else ''}", flush=True)
+        return text
+    if status == "no_funasr":
+        print(f"    [本地ASR] funasr 不可用: {text}", flush=True)
+        if notify_callback:
+            notify_callback("⚠️ 本地ASR未就绪 (funasr未安装)")
+    else:
+        print(f"    [本地ASR] 失败: {text[:200]}", flush=True)
+        if notify_callback:
+            notify_callback(f"⚠️ 本地ASR异常: {text[:80]}")
+    # 本地兜底: faster-whisper (仍为本地推理)
     return transcribe_local(audio_path, notify_callback)
 
-
-# ============================================================================
-# GLM 综合总结 -- 融合视觉和语音
-# ============================================================================
 
 def final_summarize(visual_desc: str, asr_text: str, api_key: str) -> str:
     import requests as req
@@ -2560,8 +2428,7 @@ def main():
     print(f" 总结缓存: {SUMMARY_FILE}", flush=True)
     print(f" 已回复数: {len(load_state())}", flush=True)
     print(f" 视频总结数: {len(load_summaries())}", flush=True)
-    print(f" ASR密钥: {'已配置' if DASHSCOPE_API_KEY else '❌ 未配置'}", flush=True)
-    print(f" ASR模型链: {' → '.join(ASR_MODEL_CHAIN)}", flush=True)
+    print(f" ASR: 本地 SenseVoiceSmall (funasr), 在线ASR已下线", flush=True)
     print(f" Bot UID: {BOT_MID}", flush=True)
     print("=" * 60, flush=True)
     print(flush=True)

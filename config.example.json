@@ -8,9 +8,6 @@
     "zhipu": {
         "api_key": "YOUR_ZHIPU_API_KEY_HERE"
     },
-    "dashscope": {
-        "api_key": "YOUR_DASHSCOPE_API_KEY_HERE"
-    },
     "channels": {
         "qqbot": {
             "appId": "YOUR_BOT_APPID_HERE",
@@ -32,14 +29,7 @@
         "local_model": "iic/SenseVoiceSmall",
         "local_vad_model": "iic/speech_fsmn_vad_zh-cn-16k-common-pytorch",
         "local_max_seg_ms": 15000,
-        "local_threads": 8,
-        "model_chain": [
-            "qwen3-asr-flash-2026-02-10",
-            "qwen3-asr-flash-2025-09-08",
-            "qwen3-asr-flash"
-        ],
-        "chunk_duration": 280,
-        "chunk_max_bytes": 9437184
+        "local_threads": 8
     },
     "visual": {
         "model_chain": [

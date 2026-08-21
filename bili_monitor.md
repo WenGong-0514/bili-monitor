@@ -5,7 +5,7 @@
 > 最后更新: 2026-08-21
 > 版本: v5.9.0 (Docker 容器化部署 + DeepSeek V4 Pro 文本降级链)
 > **测试平台迁移**: 2026-06-26 由原 mihomo/clashctl Linux 主机迁移至 Ubuntu 26.04 VM（systemd user service）；2026-08-21 再迁移至 Windows r730xd（192.168.101.73）+ Docker Desktop 容器化部署，详见下方「当前测试平台」。
-> **ASR 模式变更**: 2026-06-26 默认走本地 SenseVoiceSmall + FSMN-VAD (funasr) 推理，云端 qwen3-asr-flash 仅在本地失败/未装 funasr 时降级使用。
+> **ASR 模式变更**: 2026-06-26 默认走本地 SenseVoiceSmall + FSMN-VAD (funasr) 推理；**2026-08-21 在线 ASR (qwen3-asr-flash / DashScope) 已全部过期下线**，本地 SenseVoiceSmall 为唯一 ASR 路径，仅保留本地 faster-whisper 作为兜底。
 
 ---
 
@@ -188,19 +188,13 @@ tail -5 data/logs/bili_monitor.log
 - 启动后不要在几秒内去看日志, 至少等 **5 分钟** 才能看到心跳
 - 看到心跳即证明脚本正常: `[23:26:19] 💓 心跳 #20 | unread.at=0 reply=0 | 正常`
 
-### 3. ASR 密钥: 在 config.json 中配置
+### 3. ASR: 本地推理唯一路径
 
-在 `config.json` 的 `dashscope.api_key` 字段填写阿里云百炼 API Key:
-```json
-{
-    "dashscope": {
-        "api_key": "sk-xxxxxxxx"
-    }
-}
-```
-启动日志应显示 `ASR密钥: 已配置`。如果显示 `❌ 未配置`, 说明密钥未填写。
+在线 ASR (阿里云百炼 qwen3-asr-flash) 已全部过期下线，不再需要配置 `dashscope` API Key。语音识别完全在本地完成：
 
-> 兼容: 仍支持 `DASHSCOPE_API_KEY` 环境变量, 但配置文件中的值优先。
+- 主引擎: **SenseVoiceSmall + FSMN-VAD** (funasr)，CPU 推理，首次使用自动从 ModelScope 下载模型（缓存至 `~/.cache/modelscope/`，Docker 部署走命名卷 `modelscope_cache`）
+- 兜底: 本地 faster-whisper (medium)，仅在 funasr 不可用时使用（同为本地推理）
+- 启动日志应显示 `ASR: 本地 SenseVoiceSmall (funasr), 在线ASR已下线`
 
 ---
 
@@ -282,8 +276,6 @@ main()  - 15秒循环
 | `SESSDATA` / `BILI_JCT` | B站登录Cookie, 从 config.json `bilibili` 节读取 |
 | `BOT_MID` | Bot的B站UID, 从 config.json `bilibili.bot_mid` 读取 |
 | `ZHIPU_API_KEY` | 智谱AI API Key, 从 config.json `zhipu.api_key` 读取 |
-| `DASHSCOPE_API_KEY` | 阿里云百炼语音识别, 从 config.json `dashscope.api_key` 读取(兼容环境变量) |
-| `ASR_MODEL_CHAIN` | ASR降级链, 从 config.json `asr.model_chain` 读取 |
 | `VISUAL_MODEL_CHAIN` | 视觉模型降级链, 从 config.json `visual.model_chain` 读取 |
 | `MODEL_NAME` | 回复中展示的模型名, 从 config.json `monitor.model_name` 读取 |
 | `QQ_OPENID` | QQ通知目标 OpenID, 从 `channels.qqbot.openid` 读取 |
@@ -372,11 +364,9 @@ main()  - 15秒循环
 | 函数 | 说明 |
 |------|------|
 | `get_audio_info(audio_path)` | ffprobe获取音频时长和大小 |
-| `split_audio(audio_path, chunk_dir, duration)` | 超280秒/9MB的音频用ffmpeg分段 (云端链用) |
 | `_do_local_transcribe_sensevoice(audio_path)` | **v5.6新增** — 本地 SenseVoiceSmall + FSMN-VAD (funasr), 模型懒加载并跨调用复用, 返回 `(text, status)` |
-| `_do_api_transcribe(audio_path, model)` | 单次云端ASR调用 (DashScope), 返回 (text, status) |
 | `transcribe_local(audio_path, notify)` | 本地faster-whisper medium 最终降级 |
-| `transcribe_audio(audio_path, notify_callback)` | **ASR主流程 (v5.6)**: ① 若 `asr.local_first=true` 先调本地 SenseVoice → 成功即返回; ② 否则/失败时走云端模型链; ③ 全失败降级 faster-whisper |
+| `transcribe_audio(audio_path, notify_callback)` | **ASR主流程 (v5.9)**: 本地 SenseVoice 唯一路径, 成功即返回; 失败/funasr不可用时降级本地 faster-whisper |
 
 ### 文本总结 (GLM-5.1)
 
@@ -546,7 +536,7 @@ handle_chat_message()
 | 视频总结 | `glm-5.2` ✏️ | `/api/anthropic/v1/messages` (Anthropic兼容) | 免费 |
 | 意图分类 | `glm-5.2` ✏️ | `/api/anthropic/v1/messages` | 免费 |
 | 聊天对话 | `glm-5.2` ✏️ | `/api/anthropic/v1/messages` | 免费 |
-| 语音识别 | `qwen3-asr-flash` (多模型降级) | 阿里云百炼 DashScope | 免费(36000次/模型) |
+| 语音识别 | **本地 SenseVoiceSmall** (funasr) | 本地 CPU (ModelScope) | 免费、无次数限制 |
 
 > ✏️ **文本模型 ID 已可配置 (2026-06-26)**: `config.json` 的 `monitor.model_name` 直接决定实际 API 调用的模型 ID——脚本会读取该值、`.lower()` 后传给智谱 Anthropic 接口的 `"model"` 字段。当前测试平台已切到 `GLM-5.2`。改 config 后必须 `systemctl --user restart bili-monitor` 才生效。
 
@@ -559,7 +549,7 @@ handle_chat_message()
 | 场景 | 链 | 触发条件 |
 |------|-----|---------|
 | 视觉分析 | glm-4.6v-flash → glm-4v-flash | 429限流 / 1305并发过大, 每模型3次重试后切换 |
-| 语音识别 (v5.6) | **本地 SenseVoiceSmall** → 云端 flash-2026-02-10 → 2025-09-08 → flash → 本地Whisper medium | 本地失败/未装 funasr → 云端; 云端 quota_exhausted → 下一云端模型; 云端全失败 → Whisper medium |
+| 语音识别 (v5.9) | **本地 SenseVoiceSmall** → 本地 Whisper medium | 在线ASR已下线; funasr 失败/未装 → 本地 Whisper |
 | 综合总结 | 无降级(仅 glm-5.1) | 内容不足时直接返回"信息不足"而非编造 |
 
 ---
@@ -591,22 +581,14 @@ handle_chat_message()
         "local_model": "iic/SenseVoiceSmall",
         "local_vad_model": "iic/speech_fsmn_vad_zh-cn-16k-common-pytorch",
         "local_max_seg_ms": 15000,
-        "local_threads": 8,
-        "model_chain": [
-            "qwen3-asr-flash-2026-02-10",
-            "qwen3-asr-flash-2025-09-08",
-            "qwen3-asr-flash"
-        ],
-        "chunk_duration": 280,
-        "chunk_max_bytes": 9437184
+        "local_threads": 8
     }
 }
 ```
-- `local_first`: 默认 `true`。`transcribe_audio()` 先调本地 SenseVoiceSmall, 成功即返回; 失败/未装 funasr 自动降级到云端 `model_chain`
+- `local_first`: 默认 `true`。`transcribe_audio()` 调本地 SenseVoiceSmall, 成功即返回; 失败/未装 funasr 降级本地 faster-whisper
 - `local_model` / `local_vad_model`: funasr 的模型 ID (默认从 ModelScope 拉取, 首次联网缓存至 `~/.cache/modelscope/`)
 - `local_max_seg_ms`: VAD 单段最长 15 秒 (避免 SenseVoice 30s 截断)
 - `local_threads`: CPU 推理线程数 (默认 8)
-- 云端 `model_chain` 每个模型有独立 36,000 次免费额度, 仅在本地失败时使用
 
 ### 修改视觉模型降级链
 
