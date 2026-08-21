@@ -1,0 +1,13 @@
+.git
+.gitignore
+data
+logs
+*.log
+__pycache__
+*.pyc
+*.pyo
+.bak-*
+*.bak-*
+config.json
+.env
+docs

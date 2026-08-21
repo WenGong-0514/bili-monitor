@@ -13,3 +13,6 @@ venv/
 data/
 *.bak-*
 *.service.bak-*
+# 临时/调试产物  
+_tmp/  
+build.log  

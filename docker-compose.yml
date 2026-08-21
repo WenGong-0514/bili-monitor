@@ -1,0 +1,25 @@
+services:
+  bili-monitor:
+    build: .
+    image: bili-monitor:latest
+    container_name: bili-monitor
+    restart: unless-stopped
+    environment:
+      - TZ=Asia/Shanghai
+    volumes:
+      # 运行期持久化数据(状态/总结缓存/广告结果/工作目录)
+      - ./data:/app/data
+      # 本地 ASR 模型缓存(modelscope), 避免每次重建后重新下载
+      - modelscope_cache:/root/.cache/modelscope
+      # 真实配置与黑名单以只读方式挂载, 不打包进镜像
+      - ./config.json:/app/config.json:ro
+      - ./config.yaml:/app/config.yaml:ro
+      - ./blacklist.txt:/app/blacklist.txt:ro
+    logging:
+      driver: json-file
+      options:
+        max-size: "20m"
+        max-file: "3"
+
+volumes:
+  modelscope_cache:

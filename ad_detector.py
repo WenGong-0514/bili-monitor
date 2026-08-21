@@ -68,6 +68,7 @@ def load_settings():
             if value and not value.startswith("#"):
                 blacklist.append(value.lower())
     settings["blacklist"] = blacklist
+    settings["deepseek"] = monitor.get("deepseek", {})
     return settings, monitor
 
 
@@ -394,6 +395,7 @@ ASR:
 def call_text_model(prompt: str, settings: dict, monitor: dict) -> dict:
     api_key = monitor["zhipu"]["api_key"]
     model = settings["text"]["model"]
+    last_error = ""
     for attempt in range(3):
         try:
             r = requests.post(
@@ -406,10 +408,39 @@ def call_text_model(prompt: str, settings: dict, monitor: dict) -> dict:
             text = "".join(x.get("text", "") for x in data.get("content", []) if x.get("type") == "text")
             if text:
                 return parse_json_object(text)
-            print(f"  text model error: {data}", flush=True)
+            err = data.get("error", {})
+            last_error = err.get("message", str(data))[:200]
+            print(f"  text model error: {last_error}", flush=True)
         except Exception as exc:
+            last_error = str(exc)
             print(f"  text model attempt {attempt+1}: {exc}", flush=True)
         time.sleep(2)
+
+    # 降级链: GLM 不可用 → DeepSeek V4 Pro
+    ds = settings.get("deepseek", {}) or {}
+    if ds.get("api_key"):
+        try:
+            r = requests.post(
+                f"{ds.get('base_url', 'https://api.deepseek.com').rstrip('/')}/chat/completions",
+                headers={"Authorization": f"Bearer {ds['api_key']}", "Content-Type": "application/json"},
+                json={
+                    "model": ds.get("model", "deepseek-v4-pro"),
+                    "max_tokens": 1200,
+                    "messages": [{"role": "user", "content": prompt}],
+                },
+                timeout=90,
+            )
+            data = r.json()
+            text = (((data.get("choices") or [{}])[0].get("message") or {}).get("content") or "").strip()
+            if text:
+                print("  text model degraded to DeepSeek", flush=True)
+                return parse_json_object(text)
+            err = data.get("error", {})
+            print(f"  text model (deepseek) error: {err.get('message', str(data))[:200]}", flush=True)
+        except Exception as exc:
+            print(f"  text model (deepseek) attempt: {exc}", flush=True)
+    else:
+        print("  text model fallback skipped: deepseek.api_key 未配置", flush=True)
     return {"ads": []}
 
 

@@ -185,6 +185,12 @@ POLL_INTERVAL = _monitor_cfg.get("poll_interval", 15)
 AT_FALLBACK_INTERVAL = _monitor_cfg.get("at_fallback_interval", 3600)
 REPLY_FALLBACK_INTERVAL = _monitor_cfg.get("reply_fallback_interval", 3600)
 
+# --- 文本模型降级链: GLM(付费) → DeepSeek V4 Pro ---
+_deepseek_cfg = _CFG.get("deepseek", {})
+DEEPSEEK_API_KEY = _deepseek_cfg.get("api_key", "")
+DEEPSEEK_MODEL = _deepseek_cfg.get("model", "deepseek-v4-pro")
+DEEPSEEK_BASE_URL = _deepseek_cfg.get("base_url", "https://api.deepseek.com").rstrip("/")
+
 # --- 内嵌广告识别: 检测参数在 config.yaml, 黑名单在 blacklist.txt ---
 AD_DETECTION_ENABLED = bool(_CFG.get("ad_detection", {}).get("enabled", True))
 AD_RESULTS_DIR = os.path.join(_DATA_DIR, "ad_detection")
@@ -910,6 +916,81 @@ def visual_query_frames(frame_cache: list, user_question: str, api_key: str) -> 
     return _call_visual_model(content, api_key, max_tokens=500, timeout=60)
 
 
+def _call_text_with_fallback(system: str, messages: list, max_tokens: int,
+                             timeout: int = 60, label: str = "文本模型") -> str:
+    """文本生成主链路: GLM(付费) → DeepSeek V4 Pro 降级。
+
+    返回空字符串表示两条链路都失败。
+    """
+    import requests as _req
+    errors = []
+
+    # 主链路: 智谱 GLM (Anthropic 兼容接口)
+    if ZHIPU_API_KEY:
+        payload = {"model": TEXT_MODEL, "max_tokens": max_tokens, "messages": messages}
+        if system:
+            payload["system"] = system
+        try:
+            resp = _req.post(
+                "https://open.bigmodel.cn/api/anthropic/v1/messages",
+                headers={
+                    "x-api-key": ZHIPU_API_KEY,
+                    "anthropic-version": "2023-06-01",
+                    "content-type": "application/json"
+                },
+                json=payload,
+                timeout=timeout
+            )
+            data = resp.json()
+            text = "".join(
+                x.get("text", "") for x in data.get("content", [])
+                if x.get("type") == "text" and x.get("text")
+            ).strip()
+            if text:
+                return text
+            err = data.get("error", {})
+            errors.append(f"GLM: {err.get('message', str(data))[:120]}")
+        except Exception as e:
+            errors.append(f"GLM: {e}")
+    else:
+        errors.append("GLM: 未配置 zhipu.api_key")
+
+    # 降级链: DeepSeek V4 Pro (OpenAI 兼容接口)
+    if DEEPSEEK_API_KEY:
+        ds_messages = []
+        if system:
+            ds_messages.append({"role": "system", "content": system})
+        ds_messages.extend(messages)
+        try:
+            resp = _req.post(
+                f"{DEEPSEEK_BASE_URL}/chat/completions",
+                headers={
+                    "Authorization": f"Bearer {DEEPSEEK_API_KEY}",
+                    "Content-Type": "application/json"
+                },
+                json={
+                    "model": DEEPSEEK_MODEL,
+                    "max_tokens": max_tokens,
+                    "messages": ds_messages
+                },
+                timeout=timeout
+            )
+            data = resp.json()
+            text = (((data.get("choices") or [{}])[0].get("message") or {}).get("content") or "").strip()
+            if text:
+                print(f"  ⚠️ {label} GLM不可用,已降级至 {DEEPSEEK_MODEL}", flush=True)
+                return text
+            err = data.get("error", {})
+            errors.append(f"DeepSeek: {err.get('message', str(data))[:120]}")
+        except Exception as e:
+            errors.append(f"DeepSeek: {e}")
+    else:
+        errors.append("DeepSeek: 未配置 api_key")
+
+    print(f"  ⚠️ {label} 主链路与降级链均失败: {' | '.join(errors)}", flush=True)
+    return ""
+
+
 def classify_user_intent(user_message: str, has_video_summary: bool, api_key: str) -> str:
     """
     用GLM-5.1判断用户意图: 'summary' 还是 'chat'。
@@ -986,34 +1067,16 @@ def classify_user_intent(user_message: str, has_video_summary: bool, api_key: st
 
 意图:"""
 
-    try:
-        resp = req.post(
-            "https://open.bigmodel.cn/api/anthropic/v1/messages",
-            headers={
-                "x-api-key": api_key,
-                "anthropic-version": "2023-06-01",
-                "content-type": "application/json"
-            },
-            json={
-                "model": TEXT_MODEL,
-                "max_tokens": 10,
-                "messages": [{"role": "user", "content": prompt}]
-            },
-            timeout=20
-        )
-        data = resp.json()
-        if 'content' in data and data['content']:
-            for block in data['content']:
-                if block.get('type') == 'text':
-                    result = block['text'].strip().lower()
-                    if 'video_chat' in result:
-                        return "video_chat"
-                    elif 'summary' in result:
-                        return "summary"
-                    else:
-                        return "chat"
-    except Exception as e:
-        print(f"    意图分类异常: {e}")
+    result = _call_text_with_fallback(
+        None, [{"role": "user", "content": prompt}],
+        max_tokens=10, timeout=20, label="意图分类"
+    ).strip().lower()
+    if 'video_chat' in result:
+        return "video_chat"
+    elif 'summary' in result:
+        return "summary"
+    elif result:
+        return "chat"
 
     # 默认:有文字就当作聊天
     return "chat"
@@ -1090,41 +1153,14 @@ def generate_chat_reply(
     # 当前用户消息
     messages.append({"role": "user", "content": user_message if user_message else "你好"})
 
-    for attempt in range(3):
-        try:
-            resp = req.post(
-                "https://open.bigmodel.cn/api/anthropic/v1/messages",
-                headers={
-                    "x-api-key": api_key,
-                    "anthropic-version": "2023-06-01",
-                    "content-type": "application/json"
-                },
-                json={
-                    "model": TEXT_MODEL,
-                    "max_tokens": 500,
-                    "messages": messages
-                },
-                timeout=90  # chat: 延长超时
-            )
-            data = resp.json()
-            if 'content' in data and data['content']:
-                for block in data['content']:
-                    if block.get('type') == 'text' and block.get('text'):
-                        reply_text = block['text']
-                        # 安全兜底: 去掉GLM可能生成的@xxx前缀
-                        reply_text = re.sub(r'^回复\s*@\S+\s*[::：]\s*', '', reply_text).strip()
-                        reply_text = re.sub(r'@\S+', '', reply_text).strip()
-                        return reply_text
-            err = data.get('error', {})
-            if err:
-                err_msg = err.get('message', str(data))
-                print(f"    GLM对话异常(第{attempt+1}次): {err_msg[:100]}")
-        except Exception as e:
-            print(f"    GLM对话异常(第{attempt+1}次): {e}")
-        
-        if attempt < 2:
-            time.sleep(3)  # 重试间隔从2秒增加到3秒
-    
+    reply_text = _call_text_with_fallback(
+        None, messages, max_tokens=500, timeout=90, label="对话回复"
+    )
+    if reply_text:
+        # 安全兜底: 去掉模型可能生成的@xxx前缀
+        reply_text = re.sub(r'^回复\s*@\S+\s*[::：]\s*', '', reply_text).strip()
+        reply_text = re.sub(r'@\S+', '', reply_text).strip()
+        return reply_text
     return "抱歉,当前模型暂时无法响应,请稍后再试。"
 
 
@@ -1776,36 +1812,13 @@ def final_summarize(visual_desc: str, asr_text: str, api_key: str) -> str:
 5. 保持适度幽默感,但内容准确比花哨重要
 6. 重要:如果输入信息不足以判断视频真实内容,请回复"信息不足,无法准确总结"而不是编造内容
 7. 关键:你在回复中使用的所有素材(画面/语音/字幕等)都来自你自己的观察,不要提及"识别"、"语音识别"、"字幕机翻"、"识别错误"、"听不清"、"画面分析"等任何暗示技术过程或识别质量的说法。即使素材明显有误,也要直接给出你的判断,不要解释"识别错了"、"大概是空耳"、"可能是误识别"。把可能出错的片段当成你自己听到/看到的真实内容来叙述"""
-    for attempt in range(3):
-        try:
-            resp = req.post(
-                "https://open.bigmodel.cn/api/anthropic/v1/messages",
-                headers={
-                    "x-api-key": api_key,
-                    "anthropic-version": "2023-06-01",
-                    "content-type": "application/json"
-                },
-                json={
-                    "model": TEXT_MODEL,
-                    "max_tokens": 1024,
-                    "system": prompt,
-                    "messages": [{"role": "user", "content": combined}]
-                },
-                timeout=60
-            )
-            data = resp.json()
-            if 'content' in data and data['content']:
-                for block in data['content']:
-                    if block.get('type') == 'text' and block.get('text'):
-                        return block['text']
-            err = data.get('error', {})
-            if err:
-                print(f"    {MODEL_NAME} 返回错误(第{attempt+1}次): {err.get('message', str(data))[:100]}", flush=True)
-        except Exception as e:
-            print(f"    {MODEL_NAME} 异常(第{attempt+1}次): {e}", flush=True)
-        if attempt < 2:
-            time.sleep(2)
-    print(f"    {MODEL_NAME} 连续3次失败,标记为不可用", flush=True)
+    summary = _call_text_with_fallback(
+        prompt, [{"role": "user", "content": combined}],
+        max_tokens=1024, timeout=60, label="视频总结"
+    )
+    if summary:
+        return summary
+    print(f"    {MODEL_NAME} 主链路(GLM)与降级链(DeepSeek)均失败,标记为不可用", flush=True)
     return "__MODEL_UNAVAILABLE__"
 
 
@@ -1934,36 +1947,12 @@ def process_dynamic(uri: str, subject_id: str, root_id: str, title: str = '',
 3. 上限1000字,但不要凑字数——说清楚就停,简洁比冗长更好,写成一段连贯的文字,不要分点,不要换行
 4. 关键:你在回复中使用的所有素材(图文/语音等)都来自你自己的观察,不要提及"识别"、"语音识别"、"识别错误"、"画面分析"等任何暗示技术过程或识别质量的说法"""
 
-    summary = "__MODEL_UNAVAILABLE__"
-    for attempt in range(3):
-        try:
-            resp = req.post(
-                "https://open.bigmodel.cn/api/anthropic/v1/messages",
-                headers={
-                    "x-api-key": ZHIPU_API_KEY,
-                    "anthropic-version": "2023-06-01",
-                    "content-type": "application/json"
-                },
-                json={
-                    "model": TEXT_MODEL,
-                    "max_tokens": 500,
-                    "system": prompt,
-                    "messages": [{"role": "user", "content": combined}]
-                },
-                timeout=60
-            )
-            data = resp.json()
-            if 'content' in data and data['content']:
-                for block in data['content']:
-                    if block.get('type') == 'text' and block.get('text'):
-                        summary = block['text']
-                        break
-            if summary != "__MODEL_UNAVAILABLE__":
-                break
-        except Exception as e:
-            print(f"    {MODEL_NAME} 异常(第{attempt+1}次): {e}", flush=True)
-        if attempt < 2:
-            time.sleep(2)
+    summary = _call_text_with_fallback(
+        prompt, [{"role": "user", "content": combined}],
+        max_tokens=500, timeout=60, label="动态总结"
+    )
+    if not summary:
+        summary = "__MODEL_UNAVAILABLE__"
 
     return summary, comment_type
 
