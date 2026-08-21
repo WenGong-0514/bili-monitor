@@ -18,6 +18,7 @@ B站自动监控脚本：检测到 `@Bot` 后自动下载视频 → 截帧分析
 
 ## 最近更新
 
+- **2026-08-21 (v5.9.0)**: Docker 容器化部署 — 新增 `Dockerfile` + `docker-compose.yml`（CPU 版 PyTorch + funasr 本地 ASR）；文本模型新增 DeepSeek V4 Pro 降级链（GLM 不可用时自动切换）
 - **2026-08-19 (v5.8.0)**: 内嵌广告识别上线 — 在已下载视频上复用稀疏多帧视觉AI + 30秒时间戳ASR + LLM语义分析 + `blacklist.txt` 黑名单；无广告回复保持原样式，有广告在总结前追加 `检测到xx广告，大约位于mm:ss-mm:ss，跳过空降坐标mm:ss。`
 - **2026-08-19 (v5.7.0)**: 可靠消息轮询 — `unread` 15秒快速检测，@/回复列表每 3600 秒兜底；B站 API 连续超时/风控后自动退避 15 分钟并 QQ 告警；状态、总结、帧缓存、下载文件和日志全部持久化到项目内 `data/`
 
@@ -59,6 +60,30 @@ nano config.json  # 填写 B站Cookie、API Key、QQ Bot 凭据等
 mkdir -p data/logs
 nohup python3 -u bili_monitor.py >> data/logs/bili_monitor.log 2>&1 &
 ```
+## Docker 部署（推荐）
+
+```bash
+# 1. 构建镜像（无 GPU: 自动安装 CPU 版 PyTorch）
+docker compose build
+
+# 2. 配置（首次）
+cp config.example.json config.json   # 填写 B站Cookie、API Key、QQ Bot 凭据、DeepSeek 降级密钥等
+# config.yaml 广告检测参数 / blacklist.txt 黑名单 默认即可用
+
+# 3. 启动
+docker compose up -d
+docker compose logs -f   # 查看启动横幅与轮询日志
+```
+
+容器说明：
+
+- 数据持久化：`./data:/app/data`（状态、总结缓存、广告结果、工作目录全在项目自身目录内）
+- ASR 模型缓存：命名卷 `modelscope_cache`，首次视频分析时自动下载 SenseVoiceSmall，之后复用不重复下载
+- 真实配置以只读方式挂载：`config.json` / `config.yaml` / `blacklist.txt` 不入镜像、改动即时生效
+- 重启策略 `unless-stopped`，Docker 服务重启后自动拉起
+- 日志：json-file，单文件 20MB × 3 自动轮转
+
+> 提示：文本模型降级链为 智谱 GLM（付费）→ DeepSeek V4 Pro。在 `config.json` 的 `deepseek` 段填入 `api_key` 即可启用；留空则仅使用 GLM。
 
 ## 配置
 
@@ -98,6 +123,7 @@ nohup python3 -u bili_monitor.py >> data/logs/bili_monitor.log 2>&1 &
 | `asr.local_threads` | 8 | 本地 ASR 推理线程数 |
 | `asr.model_chain` | qwen3-asr-flash系列 | ASR云端降级链（本地失败时使用） |
 | `visual.model_chain` | glm-4.6v-flash系列 | 视觉模型降级链 |
+| `deepseek.api_key` | 空 | DeepSeek V4 Pro 降级链密钥（GLM 不可用时自动切换，OpenAI 兼容） |
 
 ## 详细文档
 

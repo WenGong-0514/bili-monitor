@@ -2,9 +2,9 @@
 
 > ⚠️ **AI Generated Project** — 本项目全部代码由 AI 在人工提示词引导下生成，未经人工审核。使用本项目造成的任何损失与作者无关。完整免责声明见文档末尾。
 >
-> 最后更新: 2026-08-19
-> 版本: v5.7.0 (unread快速轮询 + 小时级列表兜底 + API退避 + 项目内持久化)
-> **测试平台迁移**: 2026-06-26 由原 mihomo/clashctl Linux 主机迁移至新 Ubuntu 26.04 主机，改用 systemd user service 部署，详见下方「当前测试平台」。
+> 最后更新: 2026-08-21
+> 版本: v5.9.0 (Docker 容器化部署 + DeepSeek V4 Pro 文本降级链)
+> **测试平台迁移**: 2026-06-26 由原 mihomo/clashctl Linux 主机迁移至 Ubuntu 26.04 VM（systemd user service）；2026-08-21 再迁移至 Windows r730xd（192.168.101.73）+ Docker Desktop 容器化部署，详见下方「当前测试平台」。
 > **ASR 模式变更**: 2026-06-26 默认走本地 SenseVoiceSmall + FSMN-VAD (funasr) 推理，云端 qwen3-asr-flash 仅在本地失败/未装 funasr 时降级使用。
 
 ---
@@ -15,20 +15,23 @@ B站@消息AI自动监控脚本，常驻后台运行。检测到 `@Bot` 后自�
 
 ---
 
-## 当前测试平台 (2026-06-26 更新)
+## 当前测试平台 (2026-08-21 更新)
 
 | 项 | 值 |
 |---|---|
-| OS | Ubuntu 26.04 LTS (x86_64) |
-| CPU | Intel i5-8350U (4c/8t, AVX2) |
-| 内存 | 3.3 GB（较小，机器同时跑 SenseVoice 本地 ASR 测试） |
-| GPU | 无（VMware SVGA，纯 CPU） |
-| Python | 系统 `python3` = 3.14（缺 ML 库），**必须用 venv** |
-| venv | 在用户家目录自建（Python 3.12 + funasr + requests），路径见下方部署命令 |
-| 工作目录 | git clone 至用户家目录 |
-| 代理 | **未安装** mihomo/clash，脚本启动时探测 7890 端口失败 → 自动走直连（B 站 API 直连可用，已验证 `check_unread()` 110ms 返回） |
-| 守护方式 | **systemd user service**（`bili-monitor.service`，已 enable-linger，重启自动拉起） |
-| 日志 | `~/bili-monitor/data/logs/bili_monitor.log` |
+| OS | Windows Server（r730xd, 192.168.101.73）+ Docker Desktop (WSL2) |
+| CPU | 2× Intel Xeon E5-2673 v4 (16C32T, AVX2)，**纯 CPU 无 GPU** |
+| 内存 | 32 GB（WSL2 分配 15.5 GiB，可调 `.wslconfig`） |
+| GPU | 无 |
+| 运行时 | Docker 容器 `bili-monitor:latest`（python:3.12-slim，CPU 版 PyTorch + funasr） |
+| 工作目录 | `C:\bili-monitor`（git clone，data/ 挂载进容器持久化） |
+| 代理 | 本地代理 `127.0.0.1:7890` 运行中（脚本自动探测，B站/GitHub 均走代理） |
+| 守护方式 | `docker compose`，`restart: unless-stopped`，Docker Desktop 重启自动拉起 |
+| 日志 | `docker compose logs -f`（json-file，20MB×3 轮转） |
+| 数据 | `./data:/app/data`（状态/总结/广告结果/工作目录全部项目内持久化） |
+| ASR 模型缓存 | 命名卷 `modelscope_cache:/root/.cache/modelscope`，首次自动下载后复用 |
+
+> 历史平台: 2026-06-26 ~ 2026-08-21 运行于 Ubuntu 26.04 VM（192.168.101.202，systemd user service `bili-monitor.service`，venv `~/asrvenv`，Intel i5-8350U / 3.3GB / 无 GPU）。
 
 ### 部署/管理命令
 
@@ -70,6 +73,7 @@ WantedBy=default.target
 
 | 版本 | 日期 | 主要变更 |
 |------|------|----------|
+| v5.9.0 | 2026-08-21 | **Docker 容器化部署 + 文本降级链**: 新增 `Dockerfile`/`docker-compose.yml`（CPU 版 PyTorch + funasr 本地 ASR、数据挂载 `./data`、ASR 模型卷缓存）；文本模型新增 DeepSeek V4 Pro 降级链，智谱 GLM 失败/超时自动切换 |
 | v5.8.0 | 2026-08-19 | **内嵌广告识别**: 复用已下载视频执行稀疏多帧视觉AI + 30秒时间戳ASR + LLM语义分析 + 黑名单判断；结果持久化到 `data/ad_detection/`，有广告时仅在总结回复前追加品牌与空降坐标，无广告保持原回复 |
 | v5.7.0 | 2026-08-19 | **unread 计数不可靠修复**: 保留15秒 unread 快速轮询，@/回复列表每3600秒兜底；API连续超时/风控自动退避15分钟；全部运行文件迁移至项目内 `data/` 持久化 |
 | v1 | 2026-05-08 | 初版: 视频总结 + B站回复 + QQ通知 |
@@ -92,7 +96,29 @@ WantedBy=default.target
 
 ## ⚡ 快速启动/停止
 
-### 生产部署（systemd，当前测试平台已采用）
+### 生产部署（Docker，当前测试平台已采用）
+
+```bash
+# 首次使用: 复制配置模板并填写真实配置
+cp config.example.json config.json
+# config.json 填写 SESSDATA, bili_jct, API Key, QQ Bot 凭据; deepseek.api_key 可填降级密钥
+
+# 构建镜像（无 GPU: Dockerfile 自动装 CPU 版 PyTorch）+ 启动
+docker compose build
+docker compose up -d
+
+# 状态 / 日志 / 重启 / 停止
+docker compose ps
+docker compose logs -f
+docker compose restart
+docker compose down
+```
+
+> 数据与配置：`./data` 挂载持久化；`config.json`/`config.yaml`/`blacklist.txt` 只读挂载，改动即时生效；ASR 模型走命名卷 `modelscope_cache`。
+
+### 生产部署（systemd，历史 Linux VM 方式）
+
+```bash
 
 ```bash
 # 首次使用: 复制配置模板并填写真实配置
