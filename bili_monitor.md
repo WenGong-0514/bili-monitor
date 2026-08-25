@@ -4,7 +4,7 @@
 >
 > 最后更新: 2026-08-21
 > 版本: v5.9.0 (Docker 容器化部署 + DeepSeek V4 Pro 文本降级链)
-> **测试平台迁移**: 2026-06-26 由原 mihomo/clashctl Linux 主机迁移至 Ubuntu 26.04 VM（systemd user service）；2026-08-21 再迁移至 Windows r730xd（192.168.101.73）+ Docker Desktop 容器化部署，详见下方「当前测试平台」。
+> **测试平台迁移**: 2026-06-26 由原 mihomo/clashctl Linux 主机迁移至 Ubuntu 26.04 VM（systemd user service）；2026-08-21 再迁移至 Windows r730xd（内网服务器）+ Docker Desktop 容器化部署，详见下方「当前测试平台」。
 > **ASR 模式变更**: 2026-06-26 默认走本地 SenseVoiceSmall + FSMN-VAD (funasr) 推理；**2026-08-21 在线 ASR (qwen3-asr-flash / DashScope) 已全部过期下线**，本地 SenseVoiceSmall 为唯一 ASR 路径，仅保留本地 faster-whisper 作为兜底。
 
 ---
@@ -19,11 +19,11 @@ B站@消息AI自动监控脚本，常驻后台运行。检测到 `@Bot` 后自�
 
 | 项 | 值 |
 |---|---|
-| OS | Windows Server（r730xd, 192.168.101.73）+ Docker Desktop (WSL2) |
-| CPU | 2× Intel Xeon E5-2673 v4 (16C32T, AVX2)，**纯 CPU 无 GPU** |
+| OS | Windows Server + Docker Desktop (WSL2) |
+| CPU | 2× Intel Xeon E5-2673 v4 (16C32T, AVX2) |
 | 内存 | 32 GB（WSL2 分配 15.5 GiB，可调 `.wslconfig`） |
-| GPU | 无 |
-| 运行时 | Docker 容器 `bili-monitor:latest`（python:3.12-slim，CPU 版 PyTorch + funasr） |
+| GPU | NVIDIA GeForce GTX 1050 2GB（Pascal sm_61，驱动 582.66） |
+| 运行时 | Docker 容器 `bili-monitor:latest`（python:3.12-slim，PyTorch 2.11 cu126 + funasr，nvidia runtime） |
 | 工作目录 | `C:\bili-monitor`（git clone，data/ 挂载进容器持久化） |
 | 代理 | 本地代理 `127.0.0.1:7890` 运行中（脚本自动探测，B站/GitHub 均走代理） |
 | 守护方式 | `docker compose`，`restart: unless-stopped`，Docker Desktop 重启自动拉起 |
@@ -31,7 +31,7 @@ B站@消息AI自动监控脚本，常驻后台运行。检测到 `@Bot` 后自�
 | 数据 | `./data:/app/data`（状态/总结/广告结果/工作目录全部项目内持久化） |
 | ASR 模型缓存 | 命名卷 `modelscope_cache:/root/.cache/modelscope`，首次自动下载后复用 |
 
-> 历史平台: 2026-06-26 ~ 2026-08-21 运行于 Ubuntu 26.04 VM（192.168.101.202，systemd user service `bili-monitor.service`，venv `~/asrvenv`，Intel i5-8350U / 3.3GB / 无 GPU）。
+> 历史平台: 2026-06-26 ~ 2026-08-21 运行于 Ubuntu 26.04 VM（内网服务器，systemd user service `bili-monitor.service`，venv `~/asrvenv`，Intel i5-8350U / 3.3GB / 无 GPU）。
 
 ### 部署/管理命令
 
@@ -73,6 +73,7 @@ WantedBy=default.target
 
 | 版本 | 日期 | 主要变更 |
 |------|------|----------|
+| v5.10.0 | 2026-08-25 | **GTX1050 CUDA ASR**: Docker启用 `nvidia` runtime，安装 PyTorch 2.11.0+cu126；SenseVoiceSmall 自动 CUDA 优先/CPU回退。22个30秒分块实测23.8s（约27x实时，较CPU约4.2倍）；2GB显存峰值约1.2GB。视觉/文本仍走云端 |
 | v5.9.0 | 2026-08-21 | **Docker 容器化部署 + 文本降级链**: 新增 `Dockerfile`/`docker-compose.yml`（CPU 版 PyTorch + funasr 本地 ASR、数据挂载 `./data`、ASR 模型卷缓存）；文本模型新增 DeepSeek V4 Pro 降级链，智谱 GLM 失败/超时自动切换 |
 | v5.8.0 | 2026-08-19 | **内嵌广告识别**: 复用已下载视频执行稀疏多帧视觉AI + 30秒时间戳ASR + LLM语义分析 + 黑名单判断；结果持久化到 `data/ad_detection/`，有广告时仅在总结回复前追加品牌与空降坐标，无广告保持原回复 |
 | v5.7.0 | 2026-08-19 | **unread 计数不可靠修复**: 保留15秒 unread 快速轮询，@/回复列表每3600秒兜底；API连续超时/风控自动退避15分钟；全部运行文件迁移至项目内 `data/` 持久化 |
@@ -103,7 +104,7 @@ WantedBy=default.target
 cp config.example.json config.json
 # config.json 填写 SESSDATA, bili_jct, API Key, QQ Bot 凭据; deepseek.api_key 可填降级密钥
 
-# 构建镜像（无 GPU: Dockerfile 自动装 CPU 版 PyTorch）+ 启动
+# 构建镜像（CUDA 版 PyTorch，GPU不可用自动回退CPU）+ 启动
 docker compose build
 docker compose up -d
 

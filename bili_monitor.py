@@ -42,6 +42,7 @@
 
 import json, sys, os, subprocess, time, re, glob, base64, tempfile
 from pathlib import Path
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
 # 强制无缓冲输出,避免 nohup 日志不完整
 sys.stdout.reconfigure(line_buffering=True) if hasattr(sys.stdout, 'reconfigure') else None
@@ -119,6 +120,8 @@ ASR_LOCAL_MODEL = _ASR_CFG.get("local_model", "iic/SenseVoiceSmall")
 ASR_LOCAL_VAD_MODEL = _ASR_CFG.get("local_vad_model", "iic/speech_fsmn_vad_zh-cn-16k-common-pytorch")
 ASR_LOCAL_MAX_SEG_MS = int(_ASR_CFG.get("local_max_seg_ms", 15000))
 ASR_LOCAL_THREADS = int(_ASR_CFG.get("local_threads", 8))
+ASR_LOCAL_DEVICE = str(_ASR_CFG.get("device", "auto")).lower()
+_SENSEVOICE_DEVICE = None  # 实际使用的推理设备(cpu/cuda), 模型加载后写入
 _SENSEVOICE_MODEL = None  # 懒加载, 首次调用 _do_local_transcribe_sensevoice 时初始化
 
 # --- 视觉模型降级链 ---
@@ -1455,15 +1458,27 @@ def visual_analyze(all_frames: list, api_key: str, target_samples: int = 20, cac
     sampled = [all_frames[int(i * step)] for i in range(n)]
     batch_size = 5
     batches = [sampled[i:i + batch_size] for i in range(0, len(sampled), batch_size)]
-    descriptions = []
-    for i, batch in enumerate(batches):
-        desc = analyze_frames_batch(batch, api_key)
-        if desc:
-            descriptions.append(desc)
-            print(f"    视觉批次{i + 1}/{len(batches)}: {desc[:60]}...")
-        time.sleep(0.5)
-    return "\n".join([f"第{i + 1}部分: {d}" for i, d in enumerate(descriptions)])
+    results = {}
 
+    def _analyze(i: int, batch: list):
+        try:
+            desc = analyze_frames_batch(batch, api_key)
+        except Exception as exc:
+            print(f"    视觉批次{i + 1}异常: {exc}", flush=True)
+            desc = ""
+        return i, desc
+
+    # 多个视觉批次并行调用(最多2路并发, 受GLM限流自动重试), 减少串行等待
+    workers = min(2, len(batches))
+    with ThreadPoolExecutor(max_workers=workers) as ex:
+        futs = {ex.submit(_analyze, i, b): i for i, b in enumerate(batches)}
+        for fut in as_completed(futs):
+            i, desc = fut.result()
+            results[i] = desc
+            if desc:
+                print(f"    视觉批次{i + 1}/{len(batches)}: {desc[:60]}...")
+            time.sleep(0.3)
+    return "\n".join([f"第{i + 1}部分: {results[i]}" for i in range(len(batches)) if results.get(i)])
 
 def cache_frame_b64_list(all_frames: list, target_samples: int = 20) -> list:
     """将关键帧读取为 base64 列表并缓存,供后续追问时使用。
@@ -1518,15 +1533,57 @@ def get_audio_info(audio_path: str):
         return 0, os.path.getsize(audio_path)
 
 
+def _get_sensevoice_model():
+    """懒加载 SenseVoiceSmall + FSMN-VAD 模型(进程内全局单例)。"""
+    global _SENSEVOICE_MODEL
+    if _SENSEVOICE_MODEL is not None:
+        return _SENSEVOICE_MODEL
+    import torch
+    from funasr import AutoModel
+    torch.set_num_threads(ASR_LOCAL_THREADS)
+    try:
+        torch.set_num_interop_threads(2)
+    except RuntimeError:
+        pass  # 已设置过, 第二次调用会抛 RuntimeError
+    torch.set_float32_matmul_precision("high")
+    torch.backends.mkldnn.enabled = True
+    requested = ASR_LOCAL_DEVICE if ASR_LOCAL_DEVICE in ("auto", "cuda", "cpu") else "auto"
+    cuda_available = False
+    try:
+        cuda_available = torch.cuda.is_available()
+    except Exception as exc:
+        print(f"    [本地ASR] CUDA检测失败,使用CPU: {exc}", flush=True)
+    device = "cuda" if requested in ("auto", "cuda") and cuda_available else "cpu"
+    if requested == "cuda" and not cuda_available:
+        print("    [本地ASR] 配置请求cuda但CUDA不可用,自动回退CPU", flush=True)
+    global _SENSEVOICE_DEVICE
+    _SENSEVOICE_DEVICE = device
+    print(f"    [本地ASR] 首次加载 {ASR_LOCAL_MODEL} (含 VAD {ASR_LOCAL_VAD_MODEL}, device={device})...", flush=True)
+    _SENSEVOICE_MODEL = AutoModel(
+        model=ASR_LOCAL_MODEL,
+        vad_model=ASR_LOCAL_VAD_MODEL,
+        vad_kwargs={"max_single_segment_time": ASR_LOCAL_MAX_SEG_MS},
+        disable_update=True,
+        device=device,
+        disable_pbar=True,
+    )
+    if device == "cuda":
+        try:
+            props = torch.cuda.get_device_properties(0)
+            print(f"    [本地ASR] CUDA设备: {props.name} | {props.total_memory / 1024**3:.2f}GB", flush=True)
+        except Exception:
+            pass
+    return _SENSEVOICE_MODEL
+
+
 def _do_local_transcribe_sensevoice(audio_path: str) -> tuple:
-    """本地 SenseVoiceSmall + FSMN-VAD (funasr).
+    """本地 SenseVoiceSmall + FSMN-VAD (funasr) 整段识别。
 
     返回 (text, status):
       status="ok"             — 识别成功 (text 可能为空字符串)
       status="no_funasr"      — venv 未装 funasr, 调用方应降级到云端
       status="error"          — 真实异常, text 含错误信息
     """
-    global _SENSEVOICE_MODEL
     try:
         import torch
         from funasr import AutoModel
@@ -1545,26 +1602,7 @@ def _do_local_transcribe_sensevoice(audio_path: str) -> tuple:
             return (f"本地ASR音频预处理失败: {r.stderr[:200]}", "error")
 
     try:
-        torch.set_num_threads(ASR_LOCAL_THREADS)
-        try:
-            torch.set_num_interop_threads(2)
-        except RuntimeError:
-            pass  # 已设置过, 第二次调用会抛 RuntimeError
-        torch.set_float32_matmul_precision("high")
-        torch.backends.mkldnn.enabled = True
-
-        if _SENSEVOICE_MODEL is None:
-            print(f"    [本地ASR] 首次加载 {ASR_LOCAL_MODEL} (含 VAD {ASR_LOCAL_VAD_MODEL})...", flush=True)
-            _SENSEVOICE_MODEL = AutoModel(
-                model=ASR_LOCAL_MODEL,
-                vad_model=ASR_LOCAL_VAD_MODEL,
-                vad_kwargs={"max_single_segment_time": ASR_LOCAL_MAX_SEG_MS},
-                disable_update=True,
-                device="cpu",
-                disable_pbar=True,
-            )
-
-        res = _SENSEVOICE_MODEL.generate(
+        res = _get_sensevoice_model().generate(
             input=wav_path,
             cache={},
             language="auto",
@@ -1586,6 +1624,86 @@ def _do_local_transcribe_sensevoice(audio_path: str) -> tuple:
                 os.remove(wav_path)
             except OSError:
                 pass
+
+
+def _split_audio_chunks(audio_path: str, chunk_dir: str, chunk_sec: int = 30) -> list:
+    """将整段音频切为固定秒数的16k单声道wav分块(用于ASR时间定位与广告复用)。"""
+    os.makedirs(chunk_dir, exist_ok=True)
+    for old in glob.glob(f"{chunk_dir}/chunk_*.wav"):
+        try:
+            os.remove(old)
+        except OSError:
+            pass
+    r = subprocess.run([
+        'ffmpeg', '-hide_banner', '-loglevel', 'error', '-i', audio_path,
+        '-ar', '16000', '-ac', '1', '-f', 'segment',
+        '-segment_time', str(chunk_sec), '-c:a', 'pcm_s16le',
+        f'{chunk_dir}/chunk_%05d.wav'
+    ], capture_output=True, text=True, timeout=600)
+    if r.returncode != 0:
+        raise RuntimeError(f"音频分块失败: {r.stderr[-300:]}")
+    paths = sorted(glob.glob(f"{chunk_dir}/chunk_*.wav"))
+    return [
+        {"path": p, "start": i * chunk_sec, "end": (i + 1) * chunk_sec}
+        for i, p in enumerate(paths)
+    ]
+
+
+def _transcribe_chunks_batch(chunks: list) -> list:
+    """一次批量调用SenseVoice识别所有分块, 按key对齐回填text, 返回原chunk列表。"""
+    if not chunks:
+        return chunks
+    res = _get_sensevoice_model().generate(
+        input=[c["path"] for c in chunks],
+        cache={},
+        language="auto",
+        use_itn=True,
+        batch_size_s=60,
+    )
+    def _stem(p):
+        return os.path.splitext(os.path.basename(str(p)))[0]
+
+    by_key = {}
+    for r in res:
+        if isinstance(r, dict) and r.get("key"):
+            by_key[_stem(r["key"])] = re.sub(
+                r'<\|[^|]+\|>', '', str(r.get("text", ""))).strip()
+    for c in chunks:
+        c["text"] = by_key.get(_stem(c["path"]), "")
+    return chunks
+
+
+def transcribe_audio_chunked(audio_path: str, video_dir: str, notify_callback=None) -> tuple:
+    """分块本地ASR: 切30s分块 → 一次批量识别 → 返回 (chunks, 全文)。
+
+    chunks 形如 [{start, end, path, text}], 带时间定位, 供广告检测直接复用
+    (无需重新切音频/重新ASR)。失败时回退整段识别, 返回 ([], 全文)。
+    """
+    try:
+        import torch
+        from funasr import AutoModel
+    except ImportError as e:
+        print(f"    [本地ASR] funasr 不可用: {e.__class__.__name__}, 回退整段识别", flush=True)
+        return [], transcribe_audio(audio_path, notify_callback)
+
+    t0 = time.time()
+    chunk_dir = os.path.join(video_dir, "asr_chunks")
+    try:
+        chunks = _split_audio_chunks(audio_path, chunk_dir)
+        print(f"    [本地ASR] 切分 {len(chunks)} 个分块, 批量识别中 (device={_SENSEVOICE_DEVICE or ASR_LOCAL_DEVICE}, cpu_threads={ASR_LOCAL_THREADS})...", flush=True)
+        if notify_callback:
+            notify_callback(f"🎧 本地ASR (SenseVoiceSmall, {len(chunks)}分块) 推理中...")
+        chunks = _transcribe_chunks_batch(chunks)
+    except Exception as e:
+        print(f"    [本地ASR] 分块识别失败, 回退整段识别: {e}", flush=True)
+        return [], transcribe_audio(audio_path, notify_callback)
+
+    text = "".join(c.get("text", "") for c in chunks).strip()
+    dt = time.time() - t0
+    duration, _ = get_audio_info(audio_path)
+    rtf = (dt / duration) if duration else 0
+    print(f"    [本地ASR] 完成 {dt:.1f}s ({rtf:.2f}x 实时), {len(chunks)}块 {len(text)}字", flush=True)
+    return chunks, text
 
 
 def transcribe_local(audio_path: str, notify=None) -> str:
@@ -1830,8 +1948,13 @@ def process_dynamic(uri: str, subject_id: str, root_id: str, title: str = '',
 # ============================================================================
 
 def detect_embedded_ads(bv: str, video_path: str, fallback_duration: int,
-                         notify_callback=None) -> dict:
-    """在已下载的本地视频上执行广告识别；失败不影响原总结流程。"""
+                         notify_callback=None, all_frames=None, asr_chunks=None) -> dict:
+    """在已下载的本地视频上执行广告识别；失败不影响原总结流程。
+
+    若传入 all_frames(阶段2关键帧) 与 asr_chunks(阶段2分块ASR文本),
+    则广告检测直接复用它们(只做视觉窗口判定+LLM分组/黑名单),
+    不再重新ffmpeg切帧/切音频, 也不重新跑ASR。
+    """
     empty = {
         "bv": bv, "has_ad": False, "reply_prefix": "",
         "ads": [], "detected_at": time.time(), "error": ""
@@ -1850,10 +1973,22 @@ def detect_embedded_ads(bv: str, video_path: str, fallback_duration: int,
             duration = ad_detector.media_duration(Path(video_path))
         except Exception:
             duration = float(fallback_duration)
-        result = ad_detector.detect_local_video(
-            bv, Path(video_path), duration, settings, monitor,
-            Path(AD_RESULTS_DIR)
-        )
+        if all_frames:
+            # 复用阶段2产物: 关键帧(2s间隔)按广告视觉间隔抽稀 + 分块ASR文本
+            ad_interval = ad_detector.visual_interval(duration, settings)
+            frame_step = max(1, round(ad_interval / 2.0))
+            ad_frames = [Path(f) for f in all_frames[::frame_step]]  # ad_detector 需要 Path 对象
+            ad_ts = [min(duration, i * 2.0 * frame_step) for i in range(len(ad_frames))]
+            print(f"  广告检测复用: {len(all_frames)}帧→抽{len(ad_frames)}帧({int(ad_interval)}s间隔) + {len(asr_chunks)}块ASR", flush=True)
+            result = ad_detector.detect_with_artifacts(
+                bv, ad_frames, ad_ts, asr_chunks, duration,
+                settings, monitor, Path(AD_RESULTS_DIR)
+            )
+        else:
+            result = ad_detector.detect_local_video(
+                bv, Path(video_path), duration, settings, monitor,
+                Path(AD_RESULTS_DIR)
+            )
         if result.get("has_ad") and notify_callback:
             ads = result.get("ads", [])
             lines = [f"⚠️ 视频识别到 {len(ads)} 段广告", f"BV: {bv}"]
@@ -1873,6 +2008,13 @@ def detect_embedded_ads(bv: str, video_path: str, fallback_duration: int,
         return empty
 
 
+def _transcribe_audio_worker(audio_path: str, video_dir: str, audio_ok: bool, notify_callback=None) -> tuple:
+    """并行阶段2的ASR任务: 分块识别, 返回 (chunks, text), 供总结与广告检测共用。"""
+    if not audio_ok:
+        print("  音频提取失败,跳过ASR", flush=True)
+        return [], ""
+    return transcribe_audio_chunked(audio_path, video_dir, notify_callback)
+
 def process_video(bv: str, notify_callback=None):
     """
     对一个B站视频执行完整的分析流程。
@@ -1888,6 +2030,7 @@ def process_video(bv: str, notify_callback=None):
     try:
         os.makedirs(video_dir, exist_ok=True)
 
+
         duration = get_video_duration(bv)
         duration_str = f"{duration // 60}分{duration % 60}秒" if duration else "未知"
 
@@ -1899,32 +2042,45 @@ def process_video(bv: str, notify_callback=None):
         if not download_video(bv, video_path):
             return duration_str, "视频下载失败"
 
-        print(f"  截取关键帧(2s/帧)...", flush=True)
-        all_frames = extract_frames(video_path, frames_dir, interval=2)
-        print(f"  获得 {len(all_frames)} 帧")
+        # 并行阶段1: 切帧 + 提取音频 (两者互不依赖, 同时进行)
+        print(f"  并行截取关键帧 + 提取音频...", flush=True)
+        with ThreadPoolExecutor(max_workers=2) as ex:
+            f_frames = ex.submit(extract_frames, video_path, frames_dir, 2)
+            f_audio = ex.submit(extract_audio, video_path, audio_path)
+            all_frames = f_frames.result()
+            audio_ok = f_audio.result()
+        print(f"  获得 {len(all_frames)} 帧 | 音频提取{'成功' if audio_ok else '失败'}")
 
-        print(f"  GLM-4.6V视觉分析...", flush=True)
-        visual_desc = visual_analyze(all_frames, ZHIPU_API_KEY)
+        # 并行阶段2: 视觉AI(云端GLM) 与 本地ASR(CPU) 同时进行 —— 3次AI结果中的前2次
+        # ASR改为分块批量识别: 结果同时供总结与内嵌广告检测复用, 避免广告侧重复切音频/重复ASR
+        print(f"  并行: GLM视觉分析 + 本地ASR(分块, 供广告复用)...", flush=True)
+        with ThreadPoolExecutor(max_workers=2) as ex:
+            f_visual = ex.submit(visual_analyze, all_frames, ZHIPU_API_KEY)
+            f_asr = ex.submit(_transcribe_audio_worker, audio_path, video_dir, audio_ok, notify_callback)
+            f_cache = ex.submit(cache_frame_b64_list, all_frames)  # 缓存关键帧base64, 供后续对话追问
+            visual_desc = f_visual.result()
+            asr_chunks, asr_text = f_asr.result()
+            frame_cache = f_cache.result()
+        # 持久化分块ASR(项目内, 供广告检测与排查复用); 剥离已删除的wav路径字段
+        if asr_chunks:
+            transcript_path = f"{video_dir}/asr_transcript.json"
+            slim = [{k: c[k] for k in ("start", "end", "text") if k in c} for c in asr_chunks]
+            with open(transcript_path, 'w') as f:
+                json.dump(slim, f, ensure_ascii=False, indent=2)
+            print(f"  已保存 {len(slim)} 块ASR时间戳 → {transcript_path}")
+        if asr_text and not asr_text.startswith("语音识别失败") and not asr_text.startswith("API错误") and not asr_text.startswith("本地语音识别失败"):
+            print(f"  语音识别完成,{len(asr_text)}字")
+        elif asr_text:
+            print(f"  ⚠️  {asr_text[:120]}")
 
-        # 缓存关键帧base64,供后续对话追问时重新查看
-        frame_cache = cache_frame_b64_list(all_frames)
-
-        asr_text = ""
-        print(f"  提取音频...", flush=True)
-        if extract_audio(video_path, audio_path):
-            print(f"  ASR语音识别...", flush=True)
-            asr_text = transcribe_audio(audio_path, notify_callback)
-            if asr_text and not asr_text.startswith("语音识别失败") and not asr_text.startswith("API错误") and not asr_text.startswith("本地语音识别失败"):
-                print(f"  语音识别完成,{len(asr_text)}字")
-            else:
-                print(f"  ⚠️  {asr_text[:120]}")
-
-        print(f"  GLM综合总结...", flush=True)
-        summary = final_summarize(visual_desc, asr_text, ZHIPU_API_KEY)
-
-        # 复用刚才下载的视频做广告识别；无广告时最终回复保持原样式。
-        print(f"  内嵌广告识别...", flush=True)
-        ad_result = detect_embedded_ads(bv, video_path, duration, notify_callback)
+        # 并行阶段3: LLM整合(第3次AI结果) 与 内嵌广告识别(复用阶段2产物) 同时进行
+        print(f"  并行: GLM综合总结 + 内嵌广告识别(复用帧/ASR)...", flush=True)
+        with ThreadPoolExecutor(max_workers=2) as ex:
+            f_summary = ex.submit(final_summarize, visual_desc, asr_text, ZHIPU_API_KEY)
+            f_ad = ex.submit(detect_embedded_ads, bv, video_path, duration, notify_callback,
+                             all_frames=all_frames, asr_chunks=asr_chunks)
+            summary = f_summary.result()
+            ad_result = f_ad.result()
 
         # 保存关键帧缓存到文件,供后续追问使用
         if frame_cache:
@@ -1945,7 +2101,11 @@ def process_video(bv: str, notify_callback=None):
         frames_jpg_dir = f"{video_dir}/frames"
         if os.path.exists(frames_jpg_dir):
             subprocess.run(['rm', '-rf', frames_jpg_dir], timeout=10)
-        # 清理chunk目录
+        # 清理ASR分块wav(已持久化为asr_transcript.json, 无需保留体积大的wav)
+        asr_chunk_dir = f"{video_dir}/asr_chunks"
+        if os.path.exists(asr_chunk_dir):
+            subprocess.run(['rm', '-rf', asr_chunk_dir], timeout=10)
+        # 清理遗留chunk目录
         for d in glob.glob(f"{video_dir}/chunks_*"):
             subprocess.run(['rm', '-rf', d], timeout=10)
 
@@ -2420,7 +2580,7 @@ def fetch_reply_messages() -> list:
 
 def main():
     print("=" * 60, flush=True)
-    print(f" B站@消息监控已启动 (v5.8.0: unread快速轮询 + 小时级列表兜底 + API退避 + 项目内持久化 + 内嵌广告识别)", flush=True)
+    print(f" B站@消息监控已启动 (v5.10.0: unread快速轮询 + 小时级列表兜底 + API退避 + 项目内持久化 + 内嵌广告识别 + GPU ASR)", flush=True)
     print(f" 广告识别: {'开启' if AD_DETECTION_ENABLED else '关闭'} | 黑名单: {len(load_blacklist_keywords())}个关键词", flush=True)
     print(f" 轮询间隔: {POLL_INTERVAL}秒 | @列表兜底: {AT_FALLBACK_INTERVAL}秒 | 回复列表兜底: {REPLY_FALLBACK_INTERVAL}秒", flush=True)
     print(f" 工作目录: {WORK_DIR}", flush=True)

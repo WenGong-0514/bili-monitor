@@ -36,7 +36,7 @@ B站自动监控脚本：检测到 `@Bot` 后自动下载视频 → 截帧分析
 - 🎬 **视频自动总结** — 首次@自动下载、截帧、ASR识别、GLM总结
 - 🚫 **内嵌广告识别** — 视觉AI多帧联合判断 + 时间戳ASR语义分析 + 商家黑名单，输出广告品牌与空降坐标
 - 💬 **评论区对话** — 结合视频内容智能回复，支持追问视频细节
-- 🎙️ **本地 ASR 唯一路径** — SenseVoiceSmall + FSMN-VAD (funasr), 10x+ 实时速度; 在线 ASR 已全部过期下线, 不再走云端
+- 🎙️ **本地 ASR 唯一路径** — SenseVoiceSmall + FSMN-VAD (funasr), 支持 CUDA 加速与 CPU 自动回退; GTX1050 2GB 实测约 27x 实时, 在线 ASR 已全部过期下线
 - 🔄 **多模型降级** — 视觉模型链式降级 + 文本模型 GLM→DeepSeek V4 Pro 降级
 - 📱 **QQ 通知 (官方 Bot API)** — 处理进度和结果实时推送到 QQ, 不依赖 OpenClaw CLI
 - 🔄 **代理自适应** — 自动检测本地代理，有则走代理无则直连
@@ -63,7 +63,7 @@ nohup python3 -u bili_monitor.py >> data/logs/bili_monitor.log 2>&1 &
 ## Docker 部署（推荐）
 
 ```bash
-# 1. 构建镜像（无 GPU: 自动安装 CPU 版 PyTorch）
+# 1. 构建镜像（CUDA 版 PyTorch；GPU不可用时程序自动回退CPU）
 docker compose build
 
 # 2. 配置（首次）
@@ -119,7 +119,8 @@ docker compose logs -f   # 查看启动横幅与轮询日志
 | `ad_detection.enabled` | true | 是否启用内嵌广告识别；详细参数在 `config.yaml`，黑名单在 `blacklist.txt` |
 | `asr.local_model` | `iic/SenseVoiceSmall` | 本地 ASR 模型 |
 | `asr.local_vad_model` | `iic/speech_fsmn_vad_...` | 本地 VAD 模型 |
-| `asr.local_threads` | 8 | 本地 ASR 推理线程数 |
+| `asr.local_threads` | 8 | CPU回退时本地 ASR 推理线程数 |
+| `asr.device` | `auto` | ASR设备：`auto`(有CUDA用CUDA) / `cuda` / `cpu` |
 | `visual.model_chain` | glm-4.6v-flash系列 | 视觉模型降级链 |
 | `deepseek.api_key` | 空 | DeepSeek V4 Pro 降级链密钥（GLM 不可用时自动切换，OpenAI 兼容） |
 

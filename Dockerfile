@@ -1,5 +1,5 @@
 # bili-monitor 容器化部署
-# 无 GPU 环境: ASR 使用 CPU 推理(SenseVoiceSmall), 视觉/文本保持云端(GLM + DeepSeek 降级)
+# GPU环境: GTX1050 2GB 已验证兼容 CUDA 12.6 / sm_61; 无GPU时程序自动回退CPU
 FROM python:3.12-slim
 
 ENV DEBIAN_FRONTEND=noninteractive \
@@ -17,9 +17,10 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     && echo $TZ > /etc/timezone \
     && rm -rf /var/lib/apt/lists/*
 
-# CPU 版 PyTorch(体积小, 无 CUDA), 供 funasr 本地语音推理
-RUN pip install --index-url https://download.pytorch.org/whl/cpu \
-        torch torchaudio
+# CUDA 版 PyTorch: GTX1050(Pascal, sm_61)实测可运行 SenseVoiceSmall
+# 运行时未暴露GPU时, bili_monitor 会自动回退CPU
+RUN pip install --index-url https://download.pytorch.org/whl/cu126 \
+        torch==2.11.0+cu126 torchaudio==2.11.0+cu126
 
 WORKDIR /app
 

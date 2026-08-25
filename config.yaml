@@ -13,6 +13,7 @@ asr:
   model: iic/SenseVoiceSmall
   chunk_seconds: 30
   threads: 6
+  device: auto
 text:
   model: glm-5.2
 detection:

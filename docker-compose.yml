@@ -4,8 +4,11 @@ services:
     image: bili-monitor:latest
     container_name: bili-monitor
     restart: unless-stopped
+    runtime: nvidia
     environment:
       - TZ=Asia/Shanghai
+      - NVIDIA_VISIBLE_DEVICES=all
+      - NVIDIA_DRIVER_CAPABILITIES=compute,utility
     volumes:
       # 运行期持久化数据(状态/总结缓存/广告结果/工作目录)
       - ./data:/app/data

@@ -20,6 +20,7 @@ import time
 from dataclasses import dataclass, asdict
 from pathlib import Path
 from typing import Any
+from concurrent.futures import ThreadPoolExecutor
 
 import requests
 import yaml
@@ -145,9 +146,15 @@ def media_duration(path: Path) -> float:
     return float(p.stdout.strip())
 
 
+def visual_interval(duration: float, settings: dict) -> float:
+    """视觉广告检测的目标抽帧间隔(秒): 全片最多约 max_frames 帧, 且不小于10s、不大于60s。"""
+    max_frames = int(settings["visual"]["max_frames"])
+    interval = max(10.0, math.ceil(duration / max_frames))
+    return min(interval, 60.0)
+
+
 def extract_frames(video: Path, duration: float, settings: dict) -> tuple[list[Path], float]:
-    interval = max(10.0, math.ceil(duration / float(settings["visual"]["max_frames"]) ))
-    interval = min(interval, 60.0)
+    interval = visual_interval(duration, settings)
     frames_dir = video.parent / "frames"
     frames_dir.mkdir(exist_ok=True)
     for old in frames_dir.glob("frame_*.jpg"):
@@ -268,35 +275,62 @@ def clamp_visual_bounds(ans: dict, ts: list[float], interval: float, duration: f
     return start, end
 
 
-def visual_detection(video: Path, duration: float, settings: dict, monitor: dict) -> list[Segment]:
-    frames, interval = extract_frames(video, duration, settings)
-    timestamps = [min(duration, i * interval) for i in range(len(frames))]
-    result: list[Segment] = []
+def _visual_windows(frames: list[Path], timestamps: list[float], interval: float,
+                    duration: float, settings: dict, monitor: dict) -> list[Segment]:
+    """对给定帧列表执行滑动窗口视觉广告判定(最多3路并发)。frames/timestamps 由调用方提供。"""
     window = int(settings["visual"]["window_frames"])
     step = int(settings["visual"]["step_frames"])
-    for i in range(0, max(1, len(frames) - window + 1), step):
+    indices = list(range(0, max(1, len(frames) - window + 1), step))
+
+    def _process_window(i: int):
         idxs = list(range(i, min(len(frames), i + window)))
         if len(idxs) < 2:
-            continue
+            return None
         batch = [frames[j] for j in idxs]
         ts = [timestamps[j] for j in idxs]
         try:
             ans = call_visual_model(batch, ts, settings, monitor)
         except Exception as exc:
             print(f"  visual parse error: {exc}", flush=True)
-            continue
+            return None
         brand_text = (str(ans.get("brand", "")) + " " + str(ans.get("evidence", ""))).lower()
         visual_blacklist_hits = [b for b in settings["blacklist"] if b in brand_text]
+        seg = None
         if visual_blacklist_hits:
             start, end = clamp_visual_bounds(ans, ts, interval, duration)
-            result.append(Segment(start, end, visual_blacklist_hits[0], 0.99, "visual_blacklist", str(ans.get("evidence", ""))))
+            seg = Segment(start, end, visual_blacklist_hits[0], 0.99, "visual_blacklist", str(ans.get("evidence", "")))
         elif ans.get("ad_like"):
             start, end = clamp_visual_bounds(ans, ts, interval, duration)
-            result.append(Segment(start, end, str(ans.get("brand", "")), float(ans.get("confidence", 0)), "visual", str(ans.get("evidence", ""))))
+            seg = Segment(start, end, str(ans.get("brand", "")), float(ans.get("confidence", 0)), "visual", str(ans.get("evidence", "")))
         print(f"  visual {mmss(ts[0])}-{mmss(ts[-1])}: ad={ans.get('ad_like')} conf={ans.get('confidence')}", flush=True)
-        time.sleep(0.4)
+        return seg
+
+    result: list[Segment] = []
+    workers = min(3, max(1, len(indices)))
+    with ThreadPoolExecutor(max_workers=workers) as ex:
+        futures = [ex.submit(_process_window, i) for i in indices]
+        for fut in futures:
+            try:
+                seg = fut.result()
+            except Exception as exc:
+                print(f"  visual worker error: {exc}", flush=True)
+                continue
+            if seg is not None:
+                result.append(seg)
     return result
 
+
+def visual_detection(video: Path, duration: float, settings: dict, monitor: dict) -> list[Segment]:
+    frames, interval = extract_frames(video, duration, settings)
+    timestamps = [min(duration, i * interval) for i in range(len(frames))]
+    return _visual_windows(frames, timestamps, interval, duration, settings, monitor)
+
+
+def visual_detection_from_frames(frames: list[Path], timestamps: list[float],
+                                 duration: float, settings: dict, monitor: dict) -> list[Segment]:
+    """复用已抽好的关键帧做广告视觉判定(不再重新ffmpeg切帧)。"""
+    interval = (timestamps[1] - timestamps[0]) if len(timestamps) > 1 else 0.0
+    return _visual_windows(frames, timestamps, interval, duration, settings, monitor)
 
 def extract_asr_chunks(video: Path, settings: dict) -> list[dict]:
     chunk_sec = int(settings["asr"]["chunk_seconds"])
@@ -327,10 +361,21 @@ class SenseVoiceRunner:
         import torch
         from funasr import AutoModel
         torch.set_num_threads(int(self.settings["asr"].get("threads", 6)))
+        requested = str(self.settings["asr"].get("device", "auto")).lower()
+        if requested not in ("auto", "cuda", "cpu"):
+            requested = "auto"
+        try:
+            cuda_available = torch.cuda.is_available()
+        except Exception:
+            cuda_available = False
+        device = "cuda" if requested in ("auto", "cuda") and cuda_available else "cpu"
+        if requested == "cuda" and not cuda_available:
+            print("  local ASR: cuda unavailable, fallback to cpu", flush=True)
         self.model = AutoModel(
             model=self.settings["asr"]["model"],
-            disable_update=True, device="cpu", disable_pbar=True,
+            disable_update=True, device=device, disable_pbar=True,
         )
+        print(f"  local ASR device: {device}", flush=True)
         return self.model
 
     def transcribe(self, wav: Path) -> str:
@@ -344,17 +389,9 @@ class SenseVoiceRunner:
             return ""
 
 
-def asr_detection(video: Path, duration: float, settings: dict, monitor: dict) -> tuple[list[Segment], list[dict]]:
-    chunks = extract_asr_chunks(video, settings)
-    global SHARED_ASR
-    if SHARED_ASR is None:
-        SHARED_ASR = SenseVoiceRunner(settings)
-    runner = SHARED_ASR
-    for c in chunks:
-        c["text"] = runner.transcribe(c["path"])
-        print(f"  ASR {mmss(c['start'])}-{mmss(c['end'])}: {c['text'][:80]}", flush=True)
-    transcript = "\n".join(f"[{mmss(c['start'])}-{mmss(c['end'])}] {c['text']}" for c in chunks)
-    llm_segments = []
+def asr_analyze_chunks(chunks: list[dict], duration: float, settings: dict, monitor: dict) -> list[Segment]:
+    """对已带文本的分块ASR做LLM分组判定 + 黑名单直判, 返回广告候选段。"""
+    llm_segments: list[Segment] = []
     group_size = 24
     step = 16
     for begin in range(0, max(1, len(chunks)), step):
@@ -375,10 +412,29 @@ def asr_detection(video: Path, duration: float, settings: dict, monitor: dict) -
             break
     # Direct blacklist hits in ASR.
     for c in chunks:
-        low = c["text"].lower()
+        low = (c.get("text") or "").lower()
         hits = [b for b in settings["blacklist"] if b in low]
         if hits:
-            llm_segments.append(Segment(c["start"], min(duration, c["end"]), hits[0], 0.99, "asr_blacklist", c["text"][:180]))
+            llm_segments.append(Segment(c["start"], min(duration, c["end"]), hits[0], 0.99, "asr_blacklist", (c.get("text") or "")[:180]))
+    return llm_segments
+
+
+def asr_detection_from_chunks(chunks: list[dict], duration: float, settings: dict, monitor: dict) -> list[Segment]:
+    """复用已识别好的分块ASR文本做广告判定(不再重新切音频/重新ASR)。"""
+    return asr_analyze_chunks(chunks, duration, settings, monitor)
+
+
+def asr_detection(video: Path, duration: float, settings: dict, monitor: dict) -> tuple[list[Segment], list[dict]]:
+    chunks = extract_asr_chunks(video, settings)
+    global SHARED_ASR
+    if SHARED_ASR is None:
+        SHARED_ASR = SenseVoiceRunner(settings)
+    runner = SHARED_ASR
+    for c in chunks:
+        c["text"] = runner.transcribe(c["path"])
+        print(f"  ASR {mmss(c['start'])}-{mmss(c['end'])}: {c['text'][:80]}", flush=True)
+    transcript = "\n".join(f"[{mmss(c['start'])}-{mmss(c['end'])}] {c['text']}" for c in chunks)
+    llm_segments = asr_analyze_chunks(chunks, duration, settings, monitor)
     (video.parent / "transcript.txt").write_text(transcript, encoding="utf-8")
     return llm_segments, chunks
 
@@ -504,10 +560,19 @@ def detect_local_video(bv: str, video: Path, duration: float,
     caller's normal cleanup after this function returns.
     """
     video = Path(video)
-    result_dir.mkdir(parents=True, exist_ok=True)
     visual = visual_detection(video, duration, settings, monitor)
     asr, _chunks = asr_detection(video, duration, settings, monitor)
     ads = choose_ads(visual, asr, duration, settings)
+    result = _build_result(bv, title, duration, visual, asr, ads, result_dir)
+    transcript = video.parent / "transcript.txt"
+    if transcript.exists():
+        shutil.move(str(transcript), str(result_dir / f"{bv}.transcript.txt"))
+    return result
+
+
+def _build_result(bv: str, title: str, duration: float, visual: list[Segment],
+                  asr: list[Segment], ads: list[Segment], result_dir: Path) -> dict:
+    result_dir.mkdir(parents=True, exist_ok=True)
     result = {
         "bv": bv,
         "title": title,
@@ -527,10 +592,22 @@ def detect_local_video(bv: str, video: Path, duration: float,
     (result_dir / f"{bv}.json").write_text(
         json.dumps(result, ensure_ascii=False, indent=2), encoding="utf-8"
     )
-    transcript = video.parent / "transcript.txt"
-    if transcript.exists():
-        shutil.move(str(transcript), str(result_dir / f"{bv}.transcript.txt"))
     return result
+
+
+def detect_with_artifacts(bv: str, frames: list[Path], timestamps: list[float],
+                          asr_chunks: list[dict], duration: float,
+                          settings: dict, monitor: dict,
+                          result_dir: Path, title: str = "") -> dict:
+    """复用 bili-monitor 阶段2 已产出的关键帧与分块ASR文本做广告识别。
+
+    不再重新ffmpeg切帧/切音频, 也不重新跑ASR, 仅保留广告所需的
+    视觉窗口判定(GLM)与LLM分组判定/黑名单直判。
+    """
+    visual = visual_detection_from_frames(frames, timestamps, duration, settings, monitor)
+    asr = asr_detection_from_chunks(asr_chunks, duration, settings, monitor)
+    ads = choose_ads(visual, asr, duration, settings)
+    return _build_result(bv, title, duration, visual, asr, ads, result_dir)
 
 
 def qq_notify(text: str, settings: dict, monitor: dict):

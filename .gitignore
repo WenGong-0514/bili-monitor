@@ -13,6 +13,19 @@ venv/
 data/
 *.bak-*
 *.service.bak-*
-# ��ʱ/���Բ���  
-_tmp/  
-build.log  
+
+# 本地模型权重/缓存（不提交）
+*.pt
+*.pth
+*.onnx
+*.bin
+*.safetensors
+modelscope_cache/
+.modelscope/
+.model_cache/
+
+# 本地辅助与备份目录
+_tmp/
+.docker-clean/
+.env
+.env.*
