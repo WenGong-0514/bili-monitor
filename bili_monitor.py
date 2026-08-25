@@ -185,6 +185,12 @@ DEEPSEEK_BASE_URL = _deepseek_cfg.get("base_url", "https://api.deepseek.com").rs
 
 # --- 内嵌广告识别: 检测参数在 config.yaml, 黑名单在 blacklist.txt ---
 AD_DETECTION_ENABLED = bool(_CFG.get("ad_detection", {}).get("enabled", True))
+
+# --- 本地串行流水线 (v5.11.0): ASR → 视觉 → 文本总结 ---
+# 不做量化: 一个阶段只加载一个模型, 用完释放显存再加载下一阶段
+_LOCAL_PIPE_CFG = _CFG.get("local_pipeline", {})
+LOCAL_PIPELINE_ENABLED = bool(_LOCAL_PIPE_CFG.get("enabled", False))
+
 AD_RESULTS_DIR = os.path.join(_DATA_DIR, "ad_detection")
 os.makedirs(AD_RESULTS_DIR, exist_ok=True)
 
@@ -2051,6 +2057,95 @@ def process_video(bv: str, notify_callback=None):
             audio_ok = f_audio.result()
         print(f"  获得 {len(all_frames)} 帧 | 音频提取{'成功' if audio_ok else '失败'}")
 
+        # ============ 本地串行流水线 (v5.11.0): ASR → 视觉 → 文本总结 ============
+        # 不做量化: 每个阶段只加载一个模型, 用完释放显存再加载下一阶段
+        if LOCAL_PIPELINE_ENABLED:
+            import local_pipeline
+
+            # 阶段1: ASR 语音分析 (SenseVoice 分块, 本地; 供视觉与总结复用)
+            print(f"  本地流水线 阶段1/3: ASR语音分析...", flush=True)
+            asr_chunks, asr_text = _transcribe_audio_worker(
+                audio_path, video_dir, audio_ok, notify_callback)
+            if asr_chunks:
+                transcript_path = f"{video_dir}/asr_transcript.json"
+                slim = [{k: c[k] for k in ("start", "end", "text") if k in c}
+                        for c in asr_chunks]
+                with open(transcript_path, 'w') as f:
+                    json.dump(slim, f, ensure_ascii=False, indent=2)
+                print(f"  已保存 {len(slim)} 块ASR时间戳 → {transcript_path}", flush=True)
+            if asr_text and not asr_text.startswith("语音识别失败") and \
+                    not asr_text.startswith("API错误") and \
+                    not asr_text.startswith("本地语音识别失败"):
+                print(f"  语音识别完成,{len(asr_text)}字", flush=True)
+            elif asr_text:
+                print(f"  ⚠️  {asr_text[:120]}", flush=True)
+
+            # 缓存关键帧base64, 供后续对话追问
+            frame_cache = cache_frame_b64_list(all_frames)
+            if frame_cache:
+                cache_path = f"{WORK_DIR}/frames_cache_{bv}.json"
+                with open(cache_path, 'w') as f:
+                    json.dump(frame_cache, f)
+                print(f"  缓存了 {len(frame_cache)} 帧base64 → {cache_path}", flush=True)
+
+            # 阶段2: 视觉分析 (本地 Qwen2.5-VL, 参考阶段1语音结果)
+            print(f"  本地流水线 阶段2/3: 视觉分析(参考语音)...", flush=True)
+            frame_ts = [i * 2.0 for i in range(len(all_frames))]  # 每2秒一帧
+            try:
+                visual_desc, ad_segments = local_pipeline.visual_stage(
+                    all_frames, frame_ts, asr_text, notify_callback)
+            except Exception as exc:
+                print(f"  ⚠️ 本地视觉分析失败: {exc}", flush=True)
+                visual_desc, ad_segments = "", []
+            if visual_desc:
+                print(f"  视觉分析完成: {len(visual_desc)}字", flush=True)
+            else:
+                print(f"  ⚠️ 视觉分析无有效描述", flush=True)
+
+            # 阶段3: 纯文本总结 (本地 Qwen3-8B, 整合视觉+语音)
+            print(f"  本地流水线 阶段3/3: 文本总结...", flush=True)
+            try:
+                summary, ad_prefix = local_pipeline.text_stage(
+                    visual_desc, asr_text, ad_segments, notify_callback)
+            except Exception as exc:
+                print(f"  ⚠️ 本地文本总结失败: {exc}", flush=True)
+                summary, ad_prefix = "__MODEL_UNAVAILABLE__", ""
+
+            # 广告结果整合与持久化(兼容原 ad_detector 输出结构)
+            ad_result = {
+                "bv": bv,
+                "has_ad": bool(ad_segments),
+                "reply_prefix": ad_prefix,
+                "ads": [{
+                    "brand": s.get("brand", ""),
+                    "start": s.get("start", 0), "end": s.get("end", 0),
+                    "start_mmss": local_pipeline._mmss(s.get("start", 0)),
+                    "end_mmss": local_pipeline._mmss(s.get("end", 0)),
+                    "confidence": float(s.get("confidence", 0) or 0),
+                    "evidence": s.get("evidence", ""),
+                } for s in ad_segments],
+                "detected_at": time.time(),
+                "error": "",
+            }
+            try:
+                ad_path = os.path.join(AD_RESULTS_DIR, f"{bv}.json")
+                with open(ad_path, 'w') as f:
+                    json.dump(ad_result, f, ensure_ascii=False, indent=2)
+            except Exception as exc:
+                print(f"  ⚠️ 广告结果保存失败: {exc}", flush=True)
+
+            if ad_result["has_ad"] and notify_callback:
+                lines = [f"⚠️ 视频识别到 {len(ad_segments)} 段广告", f"BV: {bv}"]
+                for s in ad_segments:
+                    lines.append(
+                        f"品牌: {s.get('brand') or '未知'} | "
+                        f"{local_pipeline._mmss(s.get('start', 0))}-"
+                        f"{local_pipeline._mmss(s.get('end', 0))} | "
+                        f"置信度 {float(s.get('confidence', 0) or 0):.2f}")
+                notify_callback("\n".join(lines))
+
+            return duration_str, summary
+
         # 并行阶段2: 视觉AI(云端GLM) 与 本地ASR(CPU) 同时进行 —— 3次AI结果中的前2次
         # ASR改为分块批量识别: 结果同时供总结与内嵌广告检测复用, 避免广告侧重复切音频/重复ASR
         print(f"  并行: GLM视觉分析 + 本地ASR(分块, 供广告复用)...", flush=True)
@@ -2580,7 +2675,7 @@ def fetch_reply_messages() -> list:
 
 def main():
     print("=" * 60, flush=True)
-    print(f" B站@消息监控已启动 (v5.10.0: unread快速轮询 + 小时级列表兜底 + API退避 + 项目内持久化 + 内嵌广告识别 + GPU ASR)", flush=True)
+    print(f" B站@消息监控已启动 (v5.11.0: unread快速轮询 + 小时级列表兜底 + API退避 + 项目内持久化 + 内嵌广告识别 + 本地全流程ASR→视觉→文本)", flush=True)
     print(f" 广告识别: {'开启' if AD_DETECTION_ENABLED else '关闭'} | 黑名单: {len(load_blacklist_keywords())}个关键词", flush=True)
     print(f" 轮询间隔: {POLL_INTERVAL}秒 | @列表兜底: {AT_FALLBACK_INTERVAL}秒 | 回复列表兜底: {REPLY_FALLBACK_INTERVAL}秒", flush=True)
     print(f" 工作目录: {WORK_DIR}", flush=True)

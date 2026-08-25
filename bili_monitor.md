@@ -3,8 +3,8 @@
 > ⚠️ **AI Generated Project** — 本项目全部代码由 AI 在人工提示词引导下生成，未经人工审核。使用本项目造成的任何损失与作者无关。完整免责声明见文档末尾。
 >
 > 最后更新: 2026-08-25
-> 版本: v5.10.0 (Docker 容器化部署 + GTX1050 CUDA ASR + 广告检测产物复用 + DeepSeek V4 Pro 文本降级链)
-> **测试平台迁移**: 2026-06-26 由原 mihomo/clashctl Linux 主机迁移至 Ubuntu 26.04 VM（systemd user service）；2026-08-21 迁移至 Windows Server + Docker Desktop 容器化部署；2026-08-25 加入 GTX1050 GPU ASR，详见下方「当前测试平台」。
+> 版本: v5.11.0 (Docker 容器化部署 + RTX 2080 Ti 本地全流程流水线: ASR→视觉→文本, 全链路不依赖云端)
+> **测试平台迁移**: 2026-06-26 由原 mihomo/clashctl Linux 主机迁移至 Ubuntu 26.04 VM（systemd user service）；2026-08-21 迁移至 Windows Server + Docker Desktop 容器化部署；2026-08-25 加入 GPU ASR，后升级 RTX 2080 Ti 22GB 并启用本地全流程流水线（ASR→视觉→文本，不再依赖云端视觉/文本），详见下方「当前测试平台」。
 > **ASR 模式变更**: 2026-06-26 默认走本地 SenseVoiceSmall + FSMN-VAD (funasr) 推理；**2026-08-21 在线 ASR (qwen3-asr-flash / DashScope) 已全部过期下线**，本地 SenseVoiceSmall 为唯一 ASR 路径，2026-08-25 起支持 CUDA 加速与 CPU 自动回退，仅保留本地 faster-whisper 作为兜底。
 
 ---
@@ -22,8 +22,8 @@ B站@消息AI自动监控脚本，常驻后台运行。检测到 `@Bot` 后自�
 | OS | Windows Server + Docker Desktop (WSL2) |
 | CPU | 2× Intel Xeon E5-2673 v4 (16C32T, AVX2) |
 | 内存 | 32 GB（WSL2 分配 15.5 GiB，可调 `.wslconfig`） |
-| GPU | NVIDIA GeForce GTX 1050 2GB（Pascal sm_61，驱动 582.66） |
-| 运行时 | Docker 容器 `bili-monitor:latest`（python:3.12-slim，PyTorch 2.11 cu126 + funasr，nvidia runtime） |
+| GPU | NVIDIA GeForce RTX 2080 Ti 22GB（Turing sm_75） |
+| 运行时 | Docker 容器 `bili-monitor:latest`（python:3.12-slim，PyTorch 2.11 cu126 + funasr + transformers，nvidia runtime） |
 | 工作目录 | `C:\bili-monitor`（git clone，data/ 挂载进容器持久化） |
 | 代理 | 本地代理 `127.0.0.1:7890` 运行中（脚本自动探测，B站/GitHub 均走代理） |
 | 守护方式 | `docker compose`，`restart: unless-stopped`，Docker Desktop 重启自动拉起 |
@@ -73,6 +73,7 @@ WantedBy=default.target
 
 | 版本 | 日期 | 主要变更 |
 |------|------|----------|
+| v5.11.0 | 2026-08-25 | **本地全流程流水线**: 不做量化，ASR→视觉→文本 三段串行，每阶段只加载一个模型、用完立即释放显存再加载下一阶段。ASR=SenseVoiceSmall（实测19.7x实时）；视觉=Qwen2.5-VL-7B（fp16，3帧+512px，每窗口约6.9s，参考ASR文本判断画面/广告）；文本=Qwen3-8B（fp16，禁用思考，92 tokens约22.8s）。`local_pipeline.enabled` 开启后视觉/文本不再依赖云端。RTX 2080 Ti 22GB 实测十分钟视频全程约4分钟 |
 | v5.10.0 | 2026-08-25 | **GTX1050 CUDA ASR**: Docker启用 `nvidia` runtime，安装 PyTorch 2.11.0+cu126；SenseVoiceSmall 自动 CUDA 优先/CPU回退，广告检测复用阶段2关键帧与分块ASR。22个30秒分块实测23.8s（约27.7x实时，较CPU约4.2倍）；2GB显存峰值约1.2GB。视觉/文本仍走云端 |
 | v5.9.1 | 2026-08-21 | **删除在线 ASR**: qwen3-asr-flash/DashScope 云端链全部过期下线，语音识别统一为本地 SenseVoiceSmall，仅保留本地 faster-whisper 兜底 |
 | v5.9.0 | 2026-08-21 | **Docker 容器化部署 + 文本降级链**: 新增 `Dockerfile`/`docker-compose.yml`（CPU 版 PyTorch + funasr 本地 ASR、数据挂载 `./data`、ASR 模型卷缓存）；文本模型新增 DeepSeek V4 Pro 降级链，智谱 GLM 失败/超时自动切换 |
@@ -196,7 +197,7 @@ tail -5 data/logs/bili_monitor.log
 
 - 主引擎: **SenseVoiceSmall + FSMN-VAD** (funasr)，CUDA优先、CPU自动回退；首次使用自动从 ModelScope 下载模型（缓存至 `~/.cache/modelscope/`，Docker 部署走命名卷 `modelscope_cache`）
 - 兜底: 本地 faster-whisper (medium)，仅在 funasr 不可用时使用（同为本地推理）
-- 首次视频处理日志会显示 `[本地ASR] ... device=cuda` 与 `CUDA设备: NVIDIA GeForce GTX 1050 | 2.00GB`；无GPU时自动显示CPU并继续运行
+- 首次视频处理日志会显示 `[本地ASR] ... device=cuda` 与 `CUDA设备: NVIDIA GeForce RTX 2080 Ti | 22.00GB`；无GPU时自动显示CPU并继续运行
 
 ---
 
@@ -373,6 +374,13 @@ main()  - 15秒循环
 | `transcribe_audio_chunked(audio_path, video_dir)` | **ASR主流程 (v5.10)** — 分块批量识别，结果同时供总结与广告检测复用；失败回退整段识别 |
 | `transcribe_local(audio_path, notify)` | 本地faster-whisper medium 最终降级 |
 
+### 本地全流程流水线 (v5.11)
+
+| 函数 | 说明 |
+|------|------|
+| `local_pipeline.visual_stage(frame_paths, frame_ts, asr_text)` | **v5.11新增** — 本地视觉阶段：加载 Qwen2.5-VL-7B (fp16)，3帧窗口+512px 参考ASR文本判断画面与广告；返回 `(visual_desc, ad_segments)`，用完释放显存 |
+| `local_pipeline.text_stage(visual_desc, asr_text, ad_segments)` | **v5.11新增** — 本地文本阶段：加载 Qwen3-8B (fp16, 禁用思考)，整合视觉+ASR 生成总结与广告空降提示；返回 `(summary, ad_prefix)`，用完释放显存 |
+
 ### 文本总结 (GLM-5.1)
 
 | 函数 | 说明 |
@@ -542,7 +550,9 @@ handle_chat_message()
 | 视频总结 | `glm-5.2` ✏️ | `/api/anthropic/v1/messages` (Anthropic兼容) | 免费 |
 | 意图分类 | `glm-5.2` ✏️ | `/api/anthropic/v1/messages` | 免费 |
 | 聊天对话 | `glm-5.2` ✏️ | `/api/anthropic/v1/messages` | 免费 |
-| 语音识别 | **本地 SenseVoiceSmall** (funasr, CUDA优先) | 本地 GTX1050 / CPU回退 (ModelScope) | 免费、无次数限制 |
+| 语音识别 | **本地 SenseVoiceSmall** (funasr, CUDA优先) | 本地 RTX 2080 Ti / CPU回退 (ModelScope) | 免费、无次数限制 |
+| 视频帧分析 (v5.11本地) | **Qwen2.5-VL-7B-Instruct** (fp16, transformers) | 本地 GPU | 免费、无次数限制 |
+| 视频总结 (v5.11本地) | **Qwen3-8B** (fp16, 禁用思考, transformers) | 本地 GPU | 免费、无次数限制 |
 
 > ✏️ **文本模型 ID 已可配置 (2026-06-26)**: `config.json` 的 `monitor.model_name` 直接决定实际 API 调用的模型 ID——脚本会读取该值、`.lower()` 后传给智谱 Anthropic 接口的 `"model"` 字段。当前测试平台已切到 `GLM-5.2`。改 config 后必须 `systemctl --user restart bili-monitor` 才生效。
 
@@ -597,6 +607,21 @@ handle_chat_message()
 - `local_max_seg_ms`: VAD 单段最长 15 秒 (避免 SenseVoice 30s 截断)
 - `local_threads`: CPU 回退时推理线程数 (默认 8)
 - `device`: ASR设备，默认 `auto`（有CUDA用CUDA）；可强制 `cuda` 或 `cpu`，`cuda`不可用时自动回退
+
+### 启用本地全流程流水线 (v5.11)
+
+编辑 `config.json`，将 `local_pipeline.enabled` 置为 `true`：
+```json
+{
+    "local_pipeline": {
+        "enabled": true
+    }
+}
+```
+- 开启后视频处理按 **ASR → 视觉 → 文本** 三段串行执行，每阶段只加载一个模型、用完立即释放显存
+- ASR=SenseVoiceSmall；视觉=Qwen2.5-VL-7B；文本=Qwen3-8B（均为本地推理，不再依赖云端 GLM）
+- 两个 Qwen 模型首次运行自动从 hf-mirror 下载（各约16GB），缓存于命名卷 `modelscope_cache` 持久化
+- 关闭后回退为云端 GLM 视觉/文本路径
 
 ### 修改视觉模型降级链
 

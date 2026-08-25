@@ -20,12 +20,12 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 # CUDA 版 PyTorch: GTX1050(Pascal, sm_61)实测可运行 SenseVoiceSmall
 # 运行时未暴露GPU时, bili_monitor 会自动回退CPU
 RUN pip install --index-url https://download.pytorch.org/whl/cu126 \
-        torch==2.11.0+cu126 torchaudio==2.11.0+cu126
+        torch==2.11.0+cu126 torchaudio==2.11.0+cu126 torchvision==0.26.0+cu126
 
 WORKDIR /app
 
 COPY requirements.txt .
-RUN pip install -r requirements.txt
+RUN pip install -r requirements.txt -i https://pypi.tuna.tsinghua.edu.cn/simple
 
 # yt-dlp 单独安装, 便于后续升级
 RUN pip install -U yt-dlp

@@ -2,3 +2,7 @@ requests
 PyYAML
 funasr
 # torch/torchaudio 使用 CPU 版: 由 Dockerfile 通过 pytorch CPU index 安装
+
+transformers
+accelerate
+pillow

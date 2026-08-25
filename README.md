@@ -14,10 +14,11 @@
 
 ---
 
-B站自动监控脚本：检测到 `@Bot` 后自动下载视频 → 截帧分析 + ASR语音识别 → GLM总结 → 内嵌广告识别 → 评论区回复，同时通过QQ Bot通知。
+B站自动监控脚本：检测到 `@Bot` 后自动下载视频 → 截帧分析 + ASR语音识别 → 本地视觉/文本总结（v5.11 起全本地流水线）→ 内嵌广告识别 → 评论区回复，同时通过QQ Bot通知。
 
 ## 最近更新
 
+- **2026-08-25 (v5.11.0)**: 本地全流程流水线 — 不做量化，ASR→视觉→文本 三段串行，每阶段只加载一个模型用完即释放显存（ASR=SenseVoiceSmall，视觉=Qwen2.5-VL-7B，文本=Qwen3-8B）。`local_pipeline.enabled` 开启后视觉/文本不再依赖云端，RTX 2080 Ti 22GB 实测十分钟视频全程约4分钟
 - **2026-08-25 (v5.10.0)**: GTX1050 CUDA ASR — Docker 启用 `nvidia` runtime，安装 PyTorch 2.11.0+cu126；SenseVoiceSmall 自动 CUDA 优先/CPU 回退（22个30秒分块实测23.8s，约27.7x实时，较CPU约4.2倍）。同时广告检测复用阶段2关键帧与分块ASR，不再二次切帧/切音频/重复ASR
 - **2026-08-21 (v5.9.1)**: 在线 ASR 全部过期下线 — 删除云端降级链，语音识别统一为本地 SenseVoiceSmall，仅保留本地 faster-whisper 兜底
 - **2026-08-21 (v5.9.0)**: Docker 容器化部署 — 新增 `Dockerfile` + `docker-compose.yml`（CPU 版 PyTorch + funasr 本地 ASR）；文本模型新增 DeepSeek V4 Pro 降级链（GLM 不可用时自动切换）
@@ -35,10 +36,11 @@ B站自动监控脚本：检测到 `@Bot` 后自动下载视频 → 截帧分析
 
 ## 功能
 
-- 🎬 **视频自动总结** — 首次@自动下载、截帧、ASR识别、GLM总结
+- 🎬 **视频自动总结** — 首次@自动下载、截帧、ASR识别、本地全流程总结（v5.11 起 ASR→视觉→文本 全本地）
 - 🚫 **内嵌广告识别** — 视觉AI多帧联合判断 + 时间戳ASR语义分析 + 商家黑名单，输出广告品牌与空降坐标
 - 💬 **评论区对话** — 结合视频内容智能回复，支持追问视频细节
-- 🎙️ **本地 ASR 唯一路径** — SenseVoiceSmall + FSMN-VAD (funasr), 支持 CUDA 加速与 CPU 自动回退; GTX1050 2GB 实测约 27x 实时, 在线 ASR 已全部过期下线
+- 🎙️ **本地 ASR 唯一路径** — SenseVoiceSmall + FSMN-VAD (funasr), 支持 CUDA 加速与 CPU 自动回退; 在线 ASR 已全部过期下线
+- 🧠 **本地全流程 (v5.11.0)** — 不做量化，ASR→视觉→文本 三段串行，Qwen2.5-VL-7B 视觉 + Qwen3-8B 文本，全链路不依赖云端
 - 🔄 **多模型降级** — 视觉模型链式降级 + 文本模型 GLM→DeepSeek V4 Pro 降级
 - 📱 **QQ 通知 (官方 Bot API)** — 处理进度和结果实时推送到 QQ, 不依赖 OpenClaw CLI
 - 🔄 **代理自适应** — 自动检测本地代理，有则走代理无则直连
@@ -80,6 +82,8 @@ docker compose logs -f   # 查看启动横幅与轮询日志
 容器说明：
 
 - 数据持久化：`./data:/app/data`（状态、总结缓存、广告结果、工作目录全在项目自身目录内）
+- ASR 模型缓存：命名卷 `modelscope_cache`，首次视频分析时自动下载 SenseVoiceSmall，之后复用不重复下载
+- v5.11 本地全流程：视觉 Qwen2.5-VL-7B / 文本 Qwen3-8B 首次运行自动从 hf-mirror 下载（各约16GB），同样缓存于 `modelscope_cache` 卷；`config.json` 中 `local_pipeline.enabled` 开启
 - ASR 模型缓存：命名卷 `modelscope_cache`，首次视频分析时自动下载 SenseVoiceSmall，之后复用不重复下载
 - 真实配置以只读方式挂载：`config.json` / `config.yaml` / `blacklist.txt` 不入镜像、改动即时生效
 - 重启策略 `unless-stopped`，Docker 服务重启后自动拉起
@@ -123,6 +127,8 @@ docker compose logs -f   # 查看启动横幅与轮询日志
 | `asr.local_vad_model` | `iic/speech_fsmn_vad_...` | 本地 VAD 模型 |
 | `asr.local_threads` | 8 | CPU回退时本地 ASR 推理线程数 |
 | `asr.device` | `auto` | ASR设备：`auto`(有CUDA用CUDA) / `cuda` / `cpu` |
+| `local_pipeline.enabled` | false | 是否启用本地全流程流水线（ASR→视觉→文本，全本地推理，不依赖云端 GLM） |
+| `asr.device` | `auto` | ASR设备：`auto`(有CUDA用CUDA) / `cuda` / `cpu` |
 | `visual.model_chain` | glm-4.6v-flash系列 | 视觉模型降级链 |
 | `deepseek.api_key` | 空 | DeepSeek V4 Pro 降级链密钥（GLM 不可用时自动切换，OpenAI 兼容） |
 
@@ -137,6 +143,8 @@ docker compose logs -f   # 查看启动横幅与轮询日志
 - ffmpeg（截帧 + 音频提取）
 - requests（HTTP请求）
 - funasr + torch（本地 ASR, 唯一路径）
+- faster-whisper（本地 ASR 兜底，可选）
+- transformers + accelerate + torchvision（v5.11 本地视觉/文本模型推理）
 - faster-whisper（本地 ASR 兜底，可选）
 - QQ 官方 Bot 账号（[q.qq.com](https://q.qq.com) 申请, 用于通知推送）
 

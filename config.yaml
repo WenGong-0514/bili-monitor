@@ -20,3 +20,6 @@ detection:
   min_duration: 20
   merge_gap: 15
   single_confidence: 0.78
+
+local_pipeline:
+  enabled: false
