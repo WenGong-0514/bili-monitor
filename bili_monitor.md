@@ -2,10 +2,10 @@
 
 > ⚠️ **AI Generated Project** — 本项目全部代码由 AI 在人工提示词引导下生成，未经人工审核。使用本项目造成的任何损失与作者无关。完整免责声明见文档末尾。
 >
-> 最后更新: 2026-08-21
-> 版本: v5.9.0 (Docker 容器化部署 + DeepSeek V4 Pro 文本降级链)
-> **测试平台迁移**: 2026-06-26 由原 mihomo/clashctl Linux 主机迁移至 Ubuntu 26.04 VM（systemd user service）；2026-08-21 再迁移至 Windows r730xd（内网服务器）+ Docker Desktop 容器化部署，详见下方「当前测试平台」。
-> **ASR 模式变更**: 2026-06-26 默认走本地 SenseVoiceSmall + FSMN-VAD (funasr) 推理；**2026-08-21 在线 ASR (qwen3-asr-flash / DashScope) 已全部过期下线**，本地 SenseVoiceSmall 为唯一 ASR 路径，仅保留本地 faster-whisper 作为兜底。
+> 最后更新: 2026-08-25
+> 版本: v5.10.0 (Docker 容器化部署 + GTX1050 CUDA ASR + 广告检测产物复用 + DeepSeek V4 Pro 文本降级链)
+> **测试平台迁移**: 2026-06-26 由原 mihomo/clashctl Linux 主机迁移至 Ubuntu 26.04 VM（systemd user service）；2026-08-21 迁移至 Windows Server + Docker Desktop 容器化部署；2026-08-25 加入 GTX1050 GPU ASR，详见下方「当前测试平台」。
+> **ASR 模式变更**: 2026-06-26 默认走本地 SenseVoiceSmall + FSMN-VAD (funasr) 推理；**2026-08-21 在线 ASR (qwen3-asr-flash / DashScope) 已全部过期下线**，本地 SenseVoiceSmall 为唯一 ASR 路径，2026-08-25 起支持 CUDA 加速与 CPU 自动回退，仅保留本地 faster-whisper 作为兜底。
 
 ---
 
@@ -15,7 +15,7 @@ B站@消息AI自动监控脚本，常驻后台运行。检测到 `@Bot` 后自�
 
 ---
 
-## 当前测试平台 (2026-08-21 更新)
+## 当前测试平台 (2026-08-25 更新)
 
 | 项 | 值 |
 |---|---|
@@ -73,7 +73,8 @@ WantedBy=default.target
 
 | 版本 | 日期 | 主要变更 |
 |------|------|----------|
-| v5.10.0 | 2026-08-25 | **GTX1050 CUDA ASR**: Docker启用 `nvidia` runtime，安装 PyTorch 2.11.0+cu126；SenseVoiceSmall 自动 CUDA 优先/CPU回退。22个30秒分块实测23.8s（约27x实时，较CPU约4.2倍）；2GB显存峰值约1.2GB。视觉/文本仍走云端 |
+| v5.10.0 | 2026-08-25 | **GTX1050 CUDA ASR**: Docker启用 `nvidia` runtime，安装 PyTorch 2.11.0+cu126；SenseVoiceSmall 自动 CUDA 优先/CPU回退，广告检测复用阶段2关键帧与分块ASR。22个30秒分块实测23.8s（约27.7x实时，较CPU约4.2倍）；2GB显存峰值约1.2GB。视觉/文本仍走云端 |
+| v5.9.1 | 2026-08-21 | **删除在线 ASR**: qwen3-asr-flash/DashScope 云端链全部过期下线，语音识别统一为本地 SenseVoiceSmall，仅保留本地 faster-whisper 兜底 |
 | v5.9.0 | 2026-08-21 | **Docker 容器化部署 + 文本降级链**: 新增 `Dockerfile`/`docker-compose.yml`（CPU 版 PyTorch + funasr 本地 ASR、数据挂载 `./data`、ASR 模型卷缓存）；文本模型新增 DeepSeek V4 Pro 降级链，智谱 GLM 失败/超时自动切换 |
 | v5.8.0 | 2026-08-19 | **内嵌广告识别**: 复用已下载视频执行稀疏多帧视觉AI + 30秒时间戳ASR + LLM语义分析 + 黑名单判断；结果持久化到 `data/ad_detection/`，有广告时仅在总结回复前追加品牌与空降坐标，无广告保持原回复 |
 | v5.7.0 | 2026-08-19 | **unread 计数不可靠修复**: 保留15秒 unread 快速轮询，@/回复列表每3600秒兜底；API连续超时/风控自动退避15分钟；全部运行文件迁移至项目内 `data/` 持久化 |
@@ -193,9 +194,9 @@ tail -5 data/logs/bili_monitor.log
 
 在线 ASR (阿里云百炼 qwen3-asr-flash) 已全部过期下线，不再需要配置 `dashscope` API Key。语音识别完全在本地完成：
 
-- 主引擎: **SenseVoiceSmall + FSMN-VAD** (funasr)，CPU 推理，首次使用自动从 ModelScope 下载模型（缓存至 `~/.cache/modelscope/`，Docker 部署走命名卷 `modelscope_cache`）
+- 主引擎: **SenseVoiceSmall + FSMN-VAD** (funasr)，CUDA优先、CPU自动回退；首次使用自动从 ModelScope 下载模型（缓存至 `~/.cache/modelscope/`，Docker 部署走命名卷 `modelscope_cache`）
 - 兜底: 本地 faster-whisper (medium)，仅在 funasr 不可用时使用（同为本地推理）
-- 启动日志应显示 `ASR: 本地 SenseVoiceSmall (funasr), 在线ASR已下线`
+- 首次视频处理日志会显示 `[本地ASR] ... device=cuda` 与 `CUDA设备: NVIDIA GeForce GTX 1050 | 2.00GB`；无GPU时自动显示CPU并继续运行
 
 ---
 
@@ -208,7 +209,7 @@ tail -5 data/logs/bili_monitor.log
 | `data/state/active_threads.json` | 遗留文件(v2), 当前不再写入, 仅保留读取用于迁移 |
 | `data/work/frames_cache_{BV}.json` | **v4新增** — 视频关键帧base64缓存, 供后续追问使用 |
 | `data/ad_detection/{BV}.json` | **v5.8新增** — 内嵌广告检测结果、置信度、证据与回复前缀 |
-| `data/ad_detection/{BV}.transcript.txt` | **v5.8新增** — 广告识别用30秒时间戳ASR文本 |
+| `data/work/video_{BV}/asr_transcript.json` | **v5.10新增** — 30秒分块ASR时间戳文本，供广告检测与排查复用 |
 | `config.yaml` | 广告识别模型、抽帧密度、切片长度、置信度等参数 |
 | `blacklist.txt` | 广告商家黑名单，每行一个关键词，当前包含`转转` |
 | `data/work/` | yt-dlp cookies、下载视频、音频、帧等运行期文件 |
@@ -365,9 +366,12 @@ main()  - 15秒循环
 | 函数 | 说明 |
 |------|------|
 | `get_audio_info(audio_path)` | ffprobe获取音频时长和大小 |
-| `_do_local_transcribe_sensevoice(audio_path)` | **v5.6新增** — 本地 SenseVoiceSmall + FSMN-VAD (funasr), 模型懒加载并跨调用复用, 返回 `(text, status)` |
+| `_get_sensevoice_model()` | **v5.10新增** — SenseVoiceSmall + FSMN-VAD 懒加载单例；`asr.device=auto` 时 CUDA 优先、不可用自动回退 CPU |
+| `_do_local_transcribe_sensevoice(audio_path)` | 整段本地识别，作为分块识别失败时的回退，返回 `(text, status)` |
+| `_split_audio_chunks(audio_path, chunk_dir)` | **v5.10新增** — ffmpeg 切30秒/16kHz单声道wav分块，用于时间定位 |
+| `_transcribe_chunks_batch(chunks)` | **v5.10新增** — 一次批量调用 funasr 识别所有分块，按 key 回填文本 |
+| `transcribe_audio_chunked(audio_path, video_dir)` | **ASR主流程 (v5.10)** — 分块批量识别，结果同时供总结与广告检测复用；失败回退整段识别 |
 | `transcribe_local(audio_path, notify)` | 本地faster-whisper medium 最终降级 |
-| `transcribe_audio(audio_path, notify_callback)` | **ASR主流程 (v5.9)**: 本地 SenseVoice 唯一路径, 成功即返回; 失败/funasr不可用时降级本地 faster-whisper |
 
 ### 文本总结 (GLM-5.1)
 
@@ -379,8 +383,9 @@ main()  - 15秒循环
 
 | 函数 | 说明 |
 |------|------|
-| `detect_embedded_ads(bv, video_path, duration, notify)` | 在`process_video()`已下载的本地视频上执行广告识别，失败时只告警不影响总结 |
-| `ad_detector.detect_local_video()` | 稀疏多帧视觉检测 + 30秒时间戳ASR + LLM语义分析 + 黑名单，并持久化结果 |
+| `detect_embedded_ads(..., all_frames, asr_chunks)` | **v5.10** — 直接接收阶段2关键帧与分块ASR；广告识别失败只告警，不影响总结 |
+| `ad_detector.detect_with_artifacts()` | **v5.10主路径** — 复用关键帧与ASR分块，仅执行广告视觉窗口判定 + LLM分组/黑名单，不再重复媒体处理 |
+| `ad_detector.detect_local_video()` | 独立测试/兜底路径 — 自行抽帧与分块ASR，仍可脱离主流程单独运行 |
 | `load_ad_result(bv)` | 读取`data/ad_detection/{BV}.json`，复用已检测视频的结果 |
 | `build_reply_prefix(ads)` | 生成`检测到xx广告，大约位于mm:ss-mm:ss，跳过空降坐标mm:ss。`前缀 |
 
@@ -537,7 +542,7 @@ handle_chat_message()
 | 视频总结 | `glm-5.2` ✏️ | `/api/anthropic/v1/messages` (Anthropic兼容) | 免费 |
 | 意图分类 | `glm-5.2` ✏️ | `/api/anthropic/v1/messages` | 免费 |
 | 聊天对话 | `glm-5.2` ✏️ | `/api/anthropic/v1/messages` | 免费 |
-| 语音识别 | **本地 SenseVoiceSmall** (funasr) | 本地 CPU (ModelScope) | 免费、无次数限制 |
+| 语音识别 | **本地 SenseVoiceSmall** (funasr, CUDA优先) | 本地 GTX1050 / CPU回退 (ModelScope) | 免费、无次数限制 |
 
 > ✏️ **文本模型 ID 已可配置 (2026-06-26)**: `config.json` 的 `monitor.model_name` 直接决定实际 API 调用的模型 ID——脚本会读取该值、`.lower()` 后传给智谱 Anthropic 接口的 `"model"` 字段。当前测试平台已切到 `GLM-5.2`。改 config 后必须 `systemctl --user restart bili-monitor` 才生效。
 
@@ -550,7 +555,7 @@ handle_chat_message()
 | 场景 | 链 | 触发条件 |
 |------|-----|---------|
 | 视觉分析 | glm-4.6v-flash → glm-4v-flash | 429限流 / 1305并发过大, 每模型3次重试后切换 |
-| 语音识别 (v5.9) | **本地 SenseVoiceSmall** → 本地 Whisper medium | 在线ASR已下线; funasr 失败/未装 → 本地 Whisper |
+| 语音识别 (v5.10) | **本地 SenseVoiceSmall (CUDA优先)** → 本地 Whisper medium | GPU不可用自动回退CPU; funasr 失败/未装 → 本地 Whisper |
 | 综合总结 | 无降级(仅 glm-5.1) | 内容不足时直接返回"信息不足"而非编造 |
 
 ---
@@ -582,14 +587,16 @@ handle_chat_message()
         "local_model": "iic/SenseVoiceSmall",
         "local_vad_model": "iic/speech_fsmn_vad_zh-cn-16k-common-pytorch",
         "local_max_seg_ms": 15000,
-        "local_threads": 8
+        "local_threads": 8,
+        "device": "auto"
     }
 }
 ```
-- `local_first`: 默认 `true`。`transcribe_audio()` 调本地 SenseVoiceSmall, 成功即返回; 失败/未装 funasr 降级本地 faster-whisper
+- `local_first`: 默认 `true`。`transcribe_audio_chunked()` 分块批量调用本地 SenseVoiceSmall；失败时回退整段识别/funasr不可用时降级本地 faster-whisper
 - `local_model` / `local_vad_model`: funasr 的模型 ID (默认从 ModelScope 拉取, 首次联网缓存至 `~/.cache/modelscope/`)
 - `local_max_seg_ms`: VAD 单段最长 15 秒 (避免 SenseVoice 30s 截断)
-- `local_threads`: CPU 推理线程数 (默认 8)
+- `local_threads`: CPU 回退时推理线程数 (默认 8)
+- `device`: ASR设备，默认 `auto`（有CUDA用CUDA）；可强制 `cuda` 或 `cpu`，`cuda`不可用时自动回退
 
 ### 修改视觉模型降级链
 

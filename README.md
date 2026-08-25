@@ -18,6 +18,8 @@ B站自动监控脚本：检测到 `@Bot` 后自动下载视频 → 截帧分析
 
 ## 最近更新
 
+- **2026-08-25 (v5.10.0)**: GTX1050 CUDA ASR — Docker 启用 `nvidia` runtime，安装 PyTorch 2.11.0+cu126；SenseVoiceSmall 自动 CUDA 优先/CPU 回退（22个30秒分块实测23.8s，约27.7x实时，较CPU约4.2倍）。同时广告检测复用阶段2关键帧与分块ASR，不再二次切帧/切音频/重复ASR
+- **2026-08-21 (v5.9.1)**: 在线 ASR 全部过期下线 — 删除云端降级链，语音识别统一为本地 SenseVoiceSmall，仅保留本地 faster-whisper 兜底
 - **2026-08-21 (v5.9.0)**: Docker 容器化部署 — 新增 `Dockerfile` + `docker-compose.yml`（CPU 版 PyTorch + funasr 本地 ASR）；文本模型新增 DeepSeek V4 Pro 降级链（GLM 不可用时自动切换）
 - **2026-08-19 (v5.8.0)**: 内嵌广告识别上线 — 在已下载视频上复用稀疏多帧视觉AI + 30秒时间戳ASR + LLM语义分析 + `blacklist.txt` 黑名单；无广告回复保持原样式，有广告在总结前追加 `检测到xx广告，大约位于mm:ss-mm:ss，跳过空降坐标mm:ss。`
 - **2026-08-19 (v5.7.0)**: 可靠消息轮询 — `unread` 15秒快速检测，@/回复列表每 3600 秒兜底；B站 API 连续超时/风控后自动退避 15 分钟并 QQ 告警；状态、总结、帧缓存、下载文件和日志全部持久化到项目内 `data/`
