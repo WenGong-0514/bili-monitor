@@ -186,7 +186,7 @@ DEEPSEEK_BASE_URL = _deepseek_cfg.get("base_url", "https://api.deepseek.com").rs
 # --- 内嵌广告识别: 检测参数在 config.yaml, 黑名单在 blacklist.txt ---
 AD_DETECTION_ENABLED = bool(_CFG.get("ad_detection", {}).get("enabled", True))
 
-# --- 本地串行流水线 (v5.11.1): ASR → 视觉 → 文本总结 + 本地对话回复 ---
+# --- 本地串行流水线 (v5.12.0): 意图先行, 总结才跑 ASR→视觉→文本; 聊天复用缓存 ---
 # 不做量化: 一个阶段只加载一个模型, 用完释放显存再加载下一阶段
 _LOCAL_PIPE_CFG = _CFG.get("local_pipeline", {})
 LOCAL_PIPELINE_ENABLED = bool(_LOCAL_PIPE_CFG.get("enabled", False))
@@ -867,6 +867,38 @@ def extract_message_after_at(text: str, at_name: str = "") -> str:
 # 意图分类 (GLM-5.1)
 # ============================================================================
 
+
+def load_analysis_artifacts(bv: str) -> dict:
+    """加载已缓存的视频分析产物(ASR时间戳文本 + 视觉描述), 供聊天回复复用, 避免重新识别。
+
+    Returns:
+        {"asr_text": str, "visual_desc": str}
+    """
+    res = {"asr_text": "", "visual_desc": ""}
+    if not bv:
+        return res
+    video_dir = f"{WORK_DIR}/video_{bv}"
+    try:
+        ap = f"{video_dir}/asr_transcript.json"
+        if os.path.exists(ap):
+            with open(ap, encoding='utf-8') as f:
+                chunks = json.load(f)
+            res["asr_text"] = "".join(
+                str(c.get('text', '')).strip() for c in chunks
+                if str(c.get('text', '')).strip())
+    except Exception as e:
+        print(f"  ⚠️ 读取ASR缓存失败: {e}")
+    try:
+        vp = f"{video_dir}/visual_desc.json"
+        if os.path.exists(vp):
+            with open(vp, encoding='utf-8') as f:
+                d = json.load(f)
+            res["visual_desc"] = str(d.get("visual_desc", "") or "")
+    except Exception as e:
+        print(f"  ⚠️ 读取视觉描述缓存失败: {e}")
+    return res
+
+
 def load_frame_cache(bv: str) -> list:
     """加载已缓存的关键帧base64列表。"""
     cache_path = f"{WORK_DIR}/frames_cache_{bv}.json"
@@ -1084,9 +1116,9 @@ def classify_user_intent(user_message: str, has_video_summary: bool, api_key: st
     if LOCAL_PIPELINE_ENABLED:
         local_prompt = f"""你是B站评论区助手。用户在评论中@了你并留言,请判断他的意图,只输出一个词: summary 或 chat 或 video_chat。
 
-- summary: 用户明确要求视频总结/概括/介绍内容(如"总结一下""这视频讲了什么""帮我概括一下")
+- summary: 用户要求视频总结/概括/介绍内容,或消息含义模糊、没有明确话题(如"总结一下""这视频讲了什么""在吗""嗯嗯")
 - video_chat: 用户在追问视频中某个具体细节(某个画面、某个人说了什么、某个时刻发生了什么)
-- chat: 其他所有情况——闲聊、吐槽、提问互动、发表观点等(如"这游戏好难""你们在干嘛""这是在召唤队友吗""主播好厉害")
+- chat: 用户有明确具体的闲聊、吐槽、提问互动或观点表达(如"这游戏好难""你们在干嘛""这是在召唤队友吗""主播好厉害")
 
 用户消息: {user_message}
 
@@ -1117,8 +1149,8 @@ def classify_user_intent(user_message: str, has_video_summary: bool, api_key: st
     elif result:
         return "chat"
 
-    # 默认:有文字就当作聊天
-    return "chat"
+    # 默认:没有明确意图 → 视为要求总结 (v5.12: 只有总结才跑 ASR+视觉)
+    return "summary"
 
 
 # ============================================================================
@@ -1131,7 +1163,8 @@ def generate_chat_reply(
     video_summary: str,
     video_title: str,
     api_key: str,
-    visual_context: str = ''
+    visual_context: str = '',
+    video_detail: str = ''
 ) -> str:
     """
     用GLM-5.1生成对话回复。
@@ -1163,6 +1196,9 @@ def generate_chat_reply(
         system_text += "\n\n注意:你没有看过相关视频,不要假装了解视频内容。"
     if visual_context:
         system_text += f"\n\n你刚刚重新仔细查看了视频画面,以下是你看到的:\n{visual_context[:1000]}\n请根据画面内容给出准确回答。"
+    if video_detail:
+        system_text += (f"\n\n视频中的原始内容片段(语音转写与画面描述,可能有误差,"
+                        f"直接当成你看到/听到的真实内容):\n{video_detail[:1500]}")
     system_text += "\n\n要求:回复简洁自然,不要过度客套。可以用适度的幽默感。如果有上下文(之前对话过),要带入上下文。回复上限1000字,但不要凑字数——能把事情说清楚就够了,简短有力比冗长更好。如果几句话就能说明白,就不要写长。\n\n重要:不要在回复中加@用户名。B站评论区会自动把你的回复放在对应评论下方,不需要你手动@对方。绝对不要输出任何'@xxx'格式的内容。\n\n关键:你在回复中使用的所有素材(画面/语音/字幕等)都来自你自己的观察,不要提及\"识别\"、\"语音识别\"、\"字幕机翻\"、\"识别错误\"、\"听不清\"、\"画面分析\"等任何暗示技术过程或识别质量的说法。即使素材明显有误,也要直接给出你的判断,不要解释\"识别错了\"、\"大概是空耳\"、\"可能是误识别\"。把可能出错的片段当成你自己听到/看到的真实内容来叙述。"
 
     # GLM-5.1 Anthropic接口不支持system角色,改为放在第一条user消息前面
@@ -2099,7 +2135,7 @@ def process_video(bv: str, notify_callback=None):
             audio_ok = f_audio.result()
         print(f"  获得 {len(all_frames)} 帧 | 音频提取{'成功' if audio_ok else '失败'}")
 
-        # ============ 本地串行流水线 (v5.11.1): ASR → 视觉 → 文本总结 + 本地对话回复 ============
+        # ============ 本地串行流水线 (v5.12.0): 意图先行, 总结才跑 ASR→视觉→文本; 聊天复用缓存 ============
         # 不做量化: 每个阶段只加载一个模型, 用完释放显存再加载下一阶段
         if LOCAL_PIPELINE_ENABLED:
             import local_pipeline
@@ -2143,6 +2179,18 @@ def process_video(bv: str, notify_callback=None):
                 print(f"  视觉分析完成: {len(visual_desc)}字", flush=True)
             else:
                 print(f"  ⚠️ 视觉分析无有效描述", flush=True)
+
+            # 持久化视觉描述, 供后续聊天回复复用(避免重复识别)
+            if visual_desc:
+                vd_path = f"{video_dir}/visual_desc.json"
+                try:
+                    with open(vd_path, 'w') as f:
+                        json.dump({"bv": bv, "visual_desc": visual_desc,
+                                   "time": time.time()},
+                                  f, ensure_ascii=False, indent=2)
+                    print(f"  已缓存视觉描述 → {vd_path}", flush=True)
+                except Exception as exc:
+                    print(f"  ⚠️ 视觉描述保存失败: {exc}", flush=True)
 
             # 阶段3: 纯文本总结 (本地 Qwen3-8B, 整合视觉+语音)
             print(f"  本地流水线 阶段3/3: 文本总结...", flush=True)
@@ -2313,23 +2361,27 @@ def handle_chat_message(item: dict, bv: str, comment_type: int,
             print(f"  ⚠️  获取评论区上下文失败: {e}")
 
     # ----------------------------------------------------------------
-    # 新逻辑 (v5.4): 首次@必做视频分析, 再根据意图决定回复方式
     # ----------------------------------------------------------------
-    #
-    # 核心改动:
-    #   1. 首次@(无缓存) → 无论用户写了什么, 都先下载视频做分析
-    #   2. 已有缓存 → 直接复用, 不重复下载
-    #   3. 意图分类 → 决定"回复什么", 而非"是否下载"
-    #      - summary → 回复总结
-    #      - chat/video_chat → 结合视频内容对话 (不再空对空聊天)
-    #   4. 长视频(>6000s) / 官方内容 / 无BV号 仍走原有逻辑
-
+    # 新逻辑 (v5.12): 意图分析最先(本地LLM), 按意图分流
+    #   1. 先判定意图(summary/chat/video_chat), 再决定走哪条流水线
+    #   2. summary → 需要总结; 无缓存时才跑 下载+ASR+视觉+文本
+    #   3. chat/video_chat → 不重新识别; 复用已缓存的 ASR转写/视觉描述/关键帧
+    #   4. 纯@/没有明确意图 → 视为要求总结(此时才做 ASR 与图像识别)
+    # ----------------------------------------------------------------
     video_summary_for_reply = existing_summary_text if has_existing_summary else ''
     ad_prefix = video_summary_data.get('ad_prefix', '') if bv else ''
 
-    # 5. 首次@: 确保视频已分析 (有BV号且无缓存时必做)
-    if bv and not has_existing_summary:
-        print(f"  🎬 首次@该视频, 开始视频分析...")
+    # 5. 意图分析最先(本地 LLM 优先, 不触发视频分析)
+    if not user_text or not user_text.strip():
+        intent = "summary"
+        print(f"  意图: 总结 (纯@)")
+    else:
+        intent = classify_user_intent(user_text, has_existing_summary, ZHIPU_API_KEY)
+        print(f"  意图: {intent}")
+
+    # 6. summary 且无缓存 → 才跑视频分析(下载+ASR+视觉+文本)
+    if intent == "summary" and bv and not has_existing_summary:
+        print(f"  🎬 意图为总结, 开始视频分析...")
         duration_str, summary = process_video(bv, notify_callback)
         ad_result = load_ad_result(bv)
         ad_prefix = ad_result.get('reply_prefix', '')
@@ -2352,18 +2404,9 @@ def handle_chat_message(item: dict, bv: str, comment_type: int,
             save_summary(bv, summary, duration_str, ad_result)
             video_summary_for_reply = summary
     elif bv and has_existing_summary:
-        print(f"  📋 视频已有缓存, 直接复用总结")
+        print(f"  📋 视频已有缓存, 直接复用")
 
-    # 6. 意图分类
-    if not user_text or not user_text.strip():
-        intent = "summary"
-        print(f"  意图: 总结 (纯@)")
-    else:
-        intent = classify_user_intent(user_text, has_existing_summary or bool(video_summary_for_reply), ZHIPU_API_KEY)
-        print(f"  意图: {intent}")
-
-    # 7. 检查是否已经在这个 root 评论下发过总结
-    #    核心规则: Bot在此线程回复过 + 已有视频缓存 → 视为已发过总结,不再重复
+    # 7. 检查是否已经在这个 root 评论下发过总结 → 已发过则强制转 chat
     #    (不用内容相似度判断,因为B站可能拦截/替换回复内容)
     already_posted_summary_in_thread = False
     if dialog_context and video_summary_for_reply:
@@ -2372,7 +2415,6 @@ def handle_chat_message(item: dict, bv: str, comment_type: int,
                 already_posted_summary_in_thread = True
                 break
 
-    # 如果已经发过总结但意图仍是 summary,强制转为 chat
     if already_posted_summary_in_thread and intent == "summary":
         print(f"  ⚠️ 该线程下已发过总结,意图从 summary → chat")
         intent = "chat"
@@ -2390,11 +2432,23 @@ def handle_chat_message(item: dict, bv: str, comment_type: int,
             print(f"  ⚠️ 视频总结为空,回复提示")
 
     else:  # intent == "chat" or intent == "video_chat"
-        # --- 结合视频内容对话 ---
+        # --- 结合视频内容对话(复用缓存, 不重新识别) ---
         if not user_text or not user_text.strip():
             user_text = "你好"
 
-        # video_chat: 让视觉模型重新查看关键帧
+        # 复用缓存的视频分析产物(ASR转写 + 视觉描述), 让聊天回复能引用具体细节
+        artifacts = load_analysis_artifacts(bv) if bv else {}
+        video_detail = ""
+        detail_parts = []
+        if artifacts.get("visual_desc"):
+            detail_parts.append(f"【画面】{artifacts['visual_desc'][:800]}")
+        if artifacts.get("asr_text"):
+            detail_parts.append(f"【语音】{artifacts['asr_text'][:1000]}")
+        if detail_parts:
+            video_detail = "\n".join(detail_parts)
+            print(f"  📎 复用缓存分析产物: 视觉{len(artifacts.get('visual_desc',''))}字 + ASR{len(artifacts.get('asr_text',''))}字")
+
+        # video_chat: 让视觉模型重新查看关键帧(复用缓存帧, 不重新下载/识别)
         visual_context = ""
         if intent == "video_chat" and bv:
             frame_cache = load_frame_cache(bv)
@@ -2415,7 +2469,8 @@ def handle_chat_message(item: dict, bv: str, comment_type: int,
             video_summary=video_summary_for_reply,
             video_title=title,
             api_key=ZHIPU_API_KEY,
-            visual_context=visual_context
+            visual_context=visual_context,
+            video_detail=video_detail
         )
         print(f"  回复: {reply_text[:100]}...")
 
@@ -2717,7 +2772,7 @@ def fetch_reply_messages() -> list:
 
 def main():
     print("=" * 60, flush=True)
-    print(f" B站@消息监控已启动 (v5.11.1: unread快速轮询 + 小时级列表兜底 + API退避 + 项目内持久化 + 内嵌广告识别 + 本地全流程ASR→视觉→文本 + 本地对话回复)", flush=True)
+    print(f" B站@消息监控已启动 (v5.12.0: unread快速轮询 + 小时级列表兜底 + API退避 + 项目内持久化 + 内嵌广告识别 + 意图先行分流: 总结才识别, 聊天复用缓存)", flush=True)
     print(f" 广告识别: {'开启' if AD_DETECTION_ENABLED else '关闭'} | 黑名单: {len(load_blacklist_keywords())}个关键词", flush=True)
     print(f" 轮询间隔: {POLL_INTERVAL}秒 | @列表兜底: {AT_FALLBACK_INTERVAL}秒 | 回复列表兜底: {REPLY_FALLBACK_INTERVAL}秒", flush=True)
     print(f" 工作目录: {WORK_DIR}", flush=True)
