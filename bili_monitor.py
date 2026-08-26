@@ -186,7 +186,7 @@ DEEPSEEK_BASE_URL = _deepseek_cfg.get("base_url", "https://api.deepseek.com").rs
 # --- 内嵌广告识别: 检测参数在 config.yaml, 黑名单在 blacklist.txt ---
 AD_DETECTION_ENABLED = bool(_CFG.get("ad_detection", {}).get("enabled", True))
 
-# --- 本地串行流水线 (v5.11.0): ASR → 视觉 → 文本总结 ---
+# --- 本地串行流水线 (v5.11.1): ASR → 视觉 → 文本总结 + 本地对话回复 ---
 # 不做量化: 一个阶段只加载一个模型, 用完释放显存再加载下一阶段
 _LOCAL_PIPE_CFG = _CFG.get("local_pipeline", {})
 LOCAL_PIPELINE_ENABLED = bool(_LOCAL_PIPE_CFG.get("enabled", False))
@@ -915,13 +915,28 @@ def visual_query_frames(frame_cache: list, user_question: str, api_key: str) -> 
 
 
 def _call_text_with_fallback(system: str, messages: list, max_tokens: int,
-                             timeout: int = 60, label: str = "文本模型") -> str:
-    """文本生成主链路: GLM(付费) → DeepSeek V4 Pro 降级。
+                             timeout: int = 60, label: str = "文本模型",
+                             temperature: float = None) -> str:
+    """文本生成主链路: 本地 Qwen3-8B(可选) → GLM(付费) → DeepSeek V4 Pro 降级。
 
-    返回空字符串表示两条链路都失败。
+    返回空字符串表示所有链路都失败。
     """
     import requests as _req
     errors = []
+
+    # 本地优先: local_pipeline.enabled 时用本地 Qwen3-8B 生成, 不依赖云端
+    if LOCAL_PIPELINE_ENABLED:
+        try:
+            import local_pipeline
+            local_text = local_pipeline.local_generate(
+                messages, system=system, max_tokens=max_tokens,
+                temperature=temperature, label=label)
+            if local_text:
+                print(f"  ✅ {label} 使用本地模型 (Qwen3-8B)", flush=True)
+                return local_text
+            errors.append("本地模型: 无输出")
+        except Exception as e:
+            errors.append(f"本地模型: {e}")
 
     # 主链路: 智谱 GLM (Anthropic 兼容接口)
     if ZHIPU_API_KEY:
@@ -1065,6 +1080,32 @@ def classify_user_intent(user_message: str, has_video_summary: bool, api_key: st
 
 意图:"""
 
+    # 本地优先: local_pipeline.enabled 时用本地 Qwen3-8B 判断(提示词更平衡,避免闲聊被误判为总结)
+    if LOCAL_PIPELINE_ENABLED:
+        local_prompt = f"""你是B站评论区助手。用户在评论中@了你并留言,请判断他的意图,只输出一个词: summary 或 chat 或 video_chat。
+
+- summary: 用户明确要求视频总结/概括/介绍内容(如"总结一下""这视频讲了什么""帮我概括一下")
+- video_chat: 用户在追问视频中某个具体细节(某个画面、某个人说了什么、某个时刻发生了什么)
+- chat: 其他所有情况——闲聊、吐槽、提问互动、发表观点等(如"这游戏好难""你们在干嘛""这是在召唤队友吗""主播好厉害")
+
+用户消息: {user_message}
+
+意图:"""
+        try:
+            import local_pipeline
+            local_result = local_pipeline.local_generate(
+                [{"role": "user", "content": local_prompt}],
+                max_tokens=10, temperature=None, label="意图分类"
+            ).strip().lower()
+            if local_result:
+                if 'video_chat' in local_result:
+                    return "video_chat"
+                elif 'summary' in local_result:
+                    return "summary"
+                return "chat"
+        except Exception as e:
+            print(f"  ⚠️ 本地意图分类失败: {e}", flush=True)
+
     result = _call_text_with_fallback(
         None, [{"role": "user", "content": prompt}],
         max_tokens=10, timeout=20, label="意图分类"
@@ -1152,7 +1193,8 @@ def generate_chat_reply(
     messages.append({"role": "user", "content": user_message if user_message else "你好"})
 
     reply_text = _call_text_with_fallback(
-        None, messages, max_tokens=500, timeout=90, label="对话回复"
+        None, messages, max_tokens=500, timeout=90, label="对话回复",
+        temperature=0.7
     )
     if reply_text:
         # 安全兜底: 去掉模型可能生成的@xxx前缀
@@ -2057,7 +2099,7 @@ def process_video(bv: str, notify_callback=None):
             audio_ok = f_audio.result()
         print(f"  获得 {len(all_frames)} 帧 | 音频提取{'成功' if audio_ok else '失败'}")
 
-        # ============ 本地串行流水线 (v5.11.0): ASR → 视觉 → 文本总结 ============
+        # ============ 本地串行流水线 (v5.11.1): ASR → 视觉 → 文本总结 + 本地对话回复 ============
         # 不做量化: 每个阶段只加载一个模型, 用完释放显存再加载下一阶段
         if LOCAL_PIPELINE_ENABLED:
             import local_pipeline
@@ -2675,7 +2717,7 @@ def fetch_reply_messages() -> list:
 
 def main():
     print("=" * 60, flush=True)
-    print(f" B站@消息监控已启动 (v5.11.0: unread快速轮询 + 小时级列表兜底 + API退避 + 项目内持久化 + 内嵌广告识别 + 本地全流程ASR→视觉→文本)", flush=True)
+    print(f" B站@消息监控已启动 (v5.11.1: unread快速轮询 + 小时级列表兜底 + API退避 + 项目内持久化 + 内嵌广告识别 + 本地全流程ASR→视觉→文本 + 本地对话回复)", flush=True)
     print(f" 广告识别: {'开启' if AD_DETECTION_ENABLED else '关闭'} | 黑名单: {len(load_blacklist_keywords())}个关键词", flush=True)
     print(f" 轮询间隔: {POLL_INTERVAL}秒 | @列表兜底: {AT_FALLBACK_INTERVAL}秒 | 回复列表兜底: {REPLY_FALLBACK_INTERVAL}秒", flush=True)
     print(f" 工作目录: {WORK_DIR}", flush=True)

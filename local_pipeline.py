@@ -152,6 +152,7 @@ def visual_stage(frame_paths, frame_ts, asr_text="", notify=None):
     if len(asr_ctx) > 1500:
         asr_ctx = asr_ctx[:1500] + "……"
 
+    release_llm()  # 先释放常驻 LLM, 给视觉模型腾显存
     model, proc, _ = _load_vl()
     try:
         # 按窗口滑动
@@ -226,6 +227,74 @@ def _load_llm():
     return model, tok, dt
 
 
+
+# ============================================================================
+# 常驻 LLM 会话: 视频总结/意图分类/对话回复 共用 Qwen3-8B, 避免反复加载
+# (消息处理为串行, 无并发; 加载视觉模型前会先 release_llm 腾显存)
+# ============================================================================
+_LLM_SESSION = {"model": None, "tok": None}
+
+
+def _get_llm():
+    """获取(或首次加载)常驻 Qwen3-8B。模型保持常驻, 由 release_llm() 显式释放。"""
+    if _LLM_SESSION["model"] is None:
+        _LLM_SESSION["model"], _LLM_SESSION["tok"], _ = _load_llm()
+    return _LLM_SESSION["model"], _LLM_SESSION["tok"]
+
+
+def release_llm():
+    """释放常驻 LLM 显存(加载视觉模型前会自动调用)。"""
+    _free_model(_LLM_SESSION["model"], _LLM_SESSION["tok"])
+    _LLM_SESSION["model"] = _LLM_SESSION["tok"] = None
+
+
+def local_generate(messages, system=None, max_tokens=250, temperature=None,
+                   label="本地文本"):
+    """本地 Qwen3-8B 文本生成(对话回复/意图分类/动态总结等), 复用常驻模型。
+
+    Args:
+        messages: [{"role": "user"/"assistant", "content": ...}, ...]
+        system: 可选 system 提示
+        max_tokens: 最大生成 token 数
+        temperature: None=贪心解码(确定性, 适合分类); 数值=采样温度(适合对话)
+        label: 日志标签
+
+    Returns:
+        生成文本; 失败/无输出返回 ""
+    """
+    try:
+        model, tok = _get_llm()
+    except Exception as e:
+        print(f"    [本地文本] {label} 模型加载失败: {e}", flush=True)
+        return ""
+    try:
+        msgs = []
+        if system:
+            msgs.append({"role": "system", "content": system})
+        msgs.extend(messages)
+        text = tok.apply_chat_template(msgs, tokenize=False,
+                                       add_generation_prompt=True,
+                                       enable_thinking=False)
+        inputs = tok([text], return_tensors="pt").to("cuda")
+        t0 = time.time()
+        with torch.no_grad():
+            if temperature is None:
+                out = model.generate(**inputs, max_new_tokens=max_tokens,
+                                     do_sample=False)
+            else:
+                out = model.generate(**inputs, max_new_tokens=max_tokens,
+                                     do_sample=True, temperature=temperature)
+        dt = time.time() - t0
+        ans = tok.decode(out[0][inputs["input_ids"].shape[1]:],
+                         skip_special_tokens=True).strip()
+        ntok = out.shape[1] - inputs["input_ids"].shape[1]
+        print(f"    [本地文本] {label} 生成 {dt:.1f}s ({ntok} tokens)", flush=True)
+        return ans
+    except Exception as e:
+        print(f"    [本地文本] {label} 推理失败: {e}", flush=True)
+        return ""
+
+
 _LLM_SUMMARY_PROMPT = ("你是B站的一名观众,刚看完一个视频。请把视频内容总结成一段自然、连贯、口语化的中文文字。"
 "语气轻松自然,偶尔带点调侃,但不要过度娱乐化。把视频讲了什么、展示了什么、核心话题是什么说清楚,上限250字,说清楚就停。"
 "如果语音识别文本不准,主要靠画面判断。如果信息不足以判断视频真实内容,回复'信息不足,无法准确总结',不要编造。"
@@ -233,7 +302,7 @@ _LLM_SUMMARY_PROMPT = ("你是B站的一名观众,刚看完一个视频。请把
 
 
 def text_stage(visual_desc, asr_text, ad_segments=None, notify=None):
-    """本地文本阶段: 加载 Qwen3-8B, 生成总结 + 广告空降提示。
+    """本地文本阶段: 使用常驻 Qwen3-8B, 生成总结 + 广告空降提示(模型常驻供后续对话回复复用)。
 
     Returns:
         (summary, ad_prefix)
@@ -261,7 +330,7 @@ def text_stage(visual_desc, asr_text, ad_segments=None, notify=None):
             for s in ad_segments)
         combined += f"\n\n【广告检测提示】画面分析检测到疑似广告: {ad_desc}"
 
-    model, tok, _ = _load_llm()
+    model, tok = _get_llm()
     try:
         style_note = ("\n\n请直接输出总结正文: 只输出一段连贯的中文文字, "
                       "严禁使用任何标题、序号、列表、加粗、斜体、Markdown符号、emoji、分隔线, "
@@ -293,5 +362,6 @@ def text_stage(visual_desc, asr_text, ad_segments=None, notify=None):
                          f"(约{_mmss(ad.get('start', 0))}-{_mmss(ad.get('end', 0))})"
                          f" 跳过空降坐标{_mmss(ad.get('start', 0))}\n\n")
         return ans, ad_prefix
-    finally:
-        _free_model(model, tok)
+    except Exception as e:
+        print(f"    [本地文本] 总结推理失败: {e}", flush=True)
+        return "无法生成视频总结：模型推理失败", ""
