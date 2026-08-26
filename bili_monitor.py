@@ -2824,7 +2824,7 @@ def fetch_reply_messages() -> list:
 
 def main():
     print("=" * 60, flush=True)
-    print(f" B站@消息监控已启动 (v5.13.0: unread快速轮询 + 小时级列表兜底 + API退避 + 项目内持久化 + 内嵌广告识别 + 意图先行分流 + 总结长度随时长动态调整)", flush=True)
+    print(f" B站@消息监控已启动 (v5.13.1: unread快速轮询 + 小时级列表兜底 + API退避 + 项目内持久化 + 内嵌广告识别 + 意图先行分流 + 总结长度随时长调整 + 广告段合并/10s阈值/多段标记)", flush=True)
     print(f" 广告识别: {'开启' if AD_DETECTION_ENABLED else '关闭'} | 黑名单: {len(load_blacklist_keywords())}个关键词", flush=True)
     print(f" 轮询间隔: {POLL_INTERVAL}秒 | @列表兜底: {AT_FALLBACK_INTERVAL}秒 | 回复列表兜底: {REPLY_FALLBACK_INTERVAL}秒", flush=True)
     print(f" 工作目录: {WORK_DIR}", flush=True)

@@ -39,6 +39,10 @@ VL_MAX_NEW_TOKENS = int(os.environ.get("LOCAL_VL_MAX_TOKENS", "220"))
 LLM_MAX_NEW_TOKENS = int(os.environ.get("LOCAL_LLM_MAX_TOKENS", "250"))
 LLM_TEMPERATURE = float(os.environ.get("LOCAL_LLM_TEMPERATURE", "0.7"))
 
+# 广告段判定 (v5.13.1): 时长 >= AD_MIN_DURATION 才标记为广告,
+# 低于该阈值视为视频中粗略提及/一闪而过; 相邻广告窗口按截帧间隔自动合并成一段
+AD_MIN_DURATION = float(os.environ.get("LOCAL_AD_MIN_DURATION", "10"))
+
 
 def _free_model(model, proc=None):
     """释放模型显存, 供下一阶段使用。"""
@@ -130,6 +134,58 @@ def _mmss(sec):
     return f"{sec // 60:02d}:{sec % 60:02d}"
 
 
+def build_ad_prefix(ad_segments):
+    """多段广告逐段标记: 生成回复前的广告空降提示。
+
+    - 单段: "⚠️ 本视频包含转转广告(约3:00-3:24) 跳过空降坐标3:00\n\n"
+    - 多段: "⚠️ 本视频包含2段广告: 转转广告(...); 某品牌广告(...)\n\n"
+    """
+    if not ad_segments:
+        return ""
+    seg_parts = []
+    for ad in ad_segments:
+        brand = ad.get('brand') or '某'
+        seg_parts.append(
+            f"{brand}广告(约{_mmss(ad.get('start', 0))}-{_mmss(ad.get('end', 0))})"
+            f" 跳过空降坐标{_mmss(ad.get('start', 0))}")
+    if len(seg_parts) == 1:
+        return f"⚠️ 本视频包含{seg_parts[0]}\n\n"
+    return f"⚠️ 本视频包含{len(seg_parts)}段广告: " + "; ".join(seg_parts) + "\n\n"
+
+
+def merge_ad_segments(segments, min_duration=10.0, max_gap=2.0):
+    """合并相邻广告窗口并过滤过短广告段(时长 < min_duration 的不标记)。
+
+    截帧策略: 每2秒一帧, 视觉窗口3帧覆盖约4秒, 相邻窗口间隔=帧间隔。
+    因此一段真实广告会被拆成多个窗口段; 这里按实际截帧时间戳把连续窗口
+    合并成一段, 得到反映真实广告时长的合并段。max_gap 取帧间隔,
+    与截帧策略保持一致(视频越长截帧越稀疏时, 该值应随帧间隔放大)。
+    """
+    if not segments:
+        return []
+    segs = sorted(segments, key=lambda s: (s.get("start", 0), s.get("end", 0)))
+    merged = []
+    for s in segs:
+        if merged and s.get("start", 0) - merged[-1]["end"] <= max_gap:
+            m = merged[-1]
+            m["end"] = max(m["end"], s.get("end", m["end"]))
+            m["confidence"] = max(float(m.get("confidence", 0) or 0),
+                                  float(s.get("confidence", 0) or 0))
+            brands = [b for b in (m.get("brand"), s.get("brand"))
+                      if b and b != "未知"]
+            m["brand"] = brands[0] if brands else (m.get("brand") or "未知")
+            evs = [e for e in (m.get("evidence"), s.get("evidence")) if e]
+            m["evidence"] = " | ".join(evs)[:500]
+        else:
+            merged.append(dict(s))
+    kept = [m for m in merged if (m["end"] - m["start"]) >= min_duration]
+    dropped = len(merged) - len(kept)
+    if dropped:
+        print(f"  [广告] 合并后 {len(merged)} 段, 过滤 <{min_duration:.0f}s 的 {dropped} 段, "
+              f"保留 {len(kept)} 段", flush=True)
+    return kept
+
+
 def visual_stage(frame_paths, frame_ts, asr_text="", notify=None):
     """本地视觉阶段: 加载 Qwen2.5-VL, 对关键帧窗口做广告/画面判断。
 
@@ -209,6 +265,16 @@ def visual_stage(frame_paths, frame_ts, asr_text="", notify=None):
                   f"ad={ad_like} conf={conf} scene={scene[:40]}", flush=True)
             idx += step
         visual_desc = "\n".join(visual_parts)
+        # 按截帧策略合并相邻广告窗口并过滤过短广告段(时长<10s视为粗略提及)
+        if ad_segments:
+            frame_interval = (frame_ts[1] - frame_ts[0]) if len(frame_ts) > 1 else 2.0
+            window_gap = frame_interval * max(1, VL_STEP_FRAMES - VL_WIN_FRAMES + 1)
+            print(f"  [广告] 原始窗口 {len(ad_segments)} 段, 帧间隔{frame_interval:.1f}s, "
+                  f"合并间隔{window_gap:.1f}s", flush=True)
+            ad_segments = merge_ad_segments(ad_segments, AD_MIN_DURATION, window_gap)
+            for s in ad_segments:
+                print(f"  [广告] 保留: {_mmss(s['start'])}-{_mmss(s['end'])} "
+                      f"({s['end'] - s['start']:.0f}s) brand={s.get('brand') or '未知'}", flush=True)
         return visual_desc, ad_segments
     finally:
         _free_model(model, proc)
@@ -359,13 +425,8 @@ def text_stage(visual_desc, asr_text, ad_segments=None, notify=None, max_tokens=
         print(f"    [本地文本] 生成 {dt:.1f}s ({ntok} tokens)", flush=True)
         if not ans:
             ans = "无法生成视频总结：模型无输出"
-        # 广告空降前缀
-        ad_prefix = ""
-        if ad_segments:
-            ad = ad_segments[0]
-            ad_prefix = (f"⚠️ 本视频包含{ad.get('brand', '某')}广告"
-                         f"(约{_mmss(ad.get('start', 0))}-{_mmss(ad.get('end', 0))})"
-                         f" 跳过空降坐标{_mmss(ad.get('start', 0))}\n\n")
+        # 广告空降前缀: 多段广告逐段标记(时长<10s的已在 visual_stage 过滤)
+        ad_prefix = build_ad_prefix(ad_segments)
         return ans, ad_prefix
     except Exception as e:
         print(f"    [本地文本] 总结推理失败: {e}", flush=True)

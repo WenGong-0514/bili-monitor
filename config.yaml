@@ -17,7 +17,7 @@ asr:
 text:
   model: glm-5.2
 detection:
-  min_duration: 20
+  min_duration: 10
   merge_gap: 15
   single_confidence: 0.78
 
