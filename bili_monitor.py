@@ -186,7 +186,7 @@ DEEPSEEK_BASE_URL = _deepseek_cfg.get("base_url", "https://api.deepseek.com").rs
 # --- 内嵌广告识别: 检测参数在 config.yaml, 黑名单在 blacklist.txt ---
 AD_DETECTION_ENABLED = bool(_CFG.get("ad_detection", {}).get("enabled", True))
 
-# --- 本地串行流水线 (v5.12.0): 意图先行, 总结才跑 ASR→视觉→文本; 聊天复用缓存 ---
+# --- 本地串行流水线 (v5.13.0): 意图先行, 总结才跑 ASR→视觉→文本; 聊天复用缓存; 总结长度随时长调整 ---
 # 不做量化: 一个阶段只加载一个模型, 用完释放显存再加载下一阶段
 _LOCAL_PIPE_CFG = _CFG.get("local_pipeline", {})
 LOCAL_PIPELINE_ENABLED = bool(_LOCAL_PIPE_CFG.get("enabled", False))
@@ -1843,7 +1843,55 @@ def transcribe_audio(audio_path: str, notify_callback=None) -> str:
     return transcribe_local(audio_path, notify_callback)
 
 
-def final_summarize(visual_desc: str, asr_text: str, api_key: str) -> str:
+# ============================================================================
+# 总结长度随视频时长动态调整 (v5.13.0)
+#   视频越短, 可输出越少; 视频越长, 可输出越多 (下限100 token, 上限2000 token)
+#   B站单条评论/回复约 1000 字符上限, 超长总结在发送前做句子边界截断保护
+# ============================================================================
+
+BILI_COMMENT_MAX_CHARS = 1000
+
+
+def summary_max_tokens(duration: float) -> int:
+    """视频时长(秒) → 总结生成 token 上限。
+
+    短视频给少量 token, 长视频给更多 token, 避免"10秒视频几百字总结"
+    或"1小时视频几十字总结"的失衡。
+    锚点(分段线性插值): 30s→100, 1min→150, 3min→260, 10min→500,
+                       30min→1000, 1h→1500, 2h→2000
+    """
+    if not duration or duration <= 0:
+        return 400  # 未知时长, 取中等值
+    anchors = [(30, 100), (60, 150), (180, 260), (600, 500),
+               (1800, 1000), (3600, 1500), (7200, 2000)]
+    if duration <= anchors[0][0]:
+        return anchors[0][1]
+    if duration >= anchors[-1][0]:
+        return anchors[-1][1]
+    for (t1, v1), (t2, v2) in zip(anchors, anchors[1:]):
+        if t1 <= duration <= t2:
+            return int(v1 + (v2 - v1) * (duration - t1) / (t2 - t1))
+    return anchors[-1][1]
+
+
+def summary_char_limit(max_tokens: int) -> int:
+    """token 上限 → 提示词中的字数目标(留15%余量, 并受B站1000字限制)。"""
+    return max(50, min(BILI_COMMENT_MAX_CHARS, int(max_tokens * 0.85)))
+
+
+def truncate_summary(text: str) -> str:
+    """总结超长时在句子边界截断, 避免被B站评论长度限制拒绝。"""
+    if not text or len(text) <= BILI_COMMENT_MAX_CHARS:
+        return text
+    cut = text[:BILI_COMMENT_MAX_CHARS]
+    for sep in ("……", "！？", "。", "！", "？", "\n"):
+        idx = cut.rfind(sep)
+        if idx > BILI_COMMENT_MAX_CHARS * 0.5:
+            return cut[:idx + len(sep)]
+    return cut
+
+
+def final_summarize(visual_desc: str, asr_text: str, api_key: str, max_tokens: int = 1024) -> str:
     import requests as req
     parts = []
     if visual_desc:
@@ -1872,19 +1920,20 @@ def final_summarize(visual_desc: str, asr_text: str, api_key: str) -> str:
             print(f"    总结内容不足(中文{total_chinese}字/英文{total_english}词),放弃总结", flush=True)
             return "无法生成视频总结：分析内容不足，请稍后重试"
     combined = "\n\n".join(parts)
-    prompt = """你是一个B站观众,刚看完一个视频,要用自然的语气总结内容。
+    char_limit = summary_char_limit(max_tokens)
+    prompt = f"""你是一个B站观众,刚看完一个视频,要用自然的语气总结内容。
 
 要求:
 1. 语气轻松自然,偶尔可以带点调侃,但不要过度娱乐化或戏谑
 2. 把视频内容说清楚--讲了什么、展示了什么、核心话题是什么
 3. 如果语音识别文本不准,主要靠画面判断
-4. 上限1000字,但不要凑字数——说清楚就停,简洁比冗长更好,写成一段连贯的文字,不要分点,不要换行
+4. 根据视频长度,总结控制在{char_limit}字以内,不要凑字数——说清楚就停,简洁比冗长更好,写成一段连贯的文字,不要分点,不要换行
 5. 保持适度幽默感,但内容准确比花哨重要
 6. 重要:如果输入信息不足以判断视频真实内容,请回复"信息不足,无法准确总结"而不是编造内容
 7. 关键:你在回复中使用的所有素材(画面/语音/字幕等)都来自你自己的观察,不要提及"识别"、"语音识别"、"字幕机翻"、"识别错误"、"听不清"、"画面分析"等任何暗示技术过程或识别质量的说法。即使素材明显有误,也要直接给出你的判断,不要解释"识别错了"、"大概是空耳"、"可能是误识别"。把可能出错的片段当成你自己听到/看到的真实内容来叙述"""
     summary = _call_text_with_fallback(
         prompt, [{"role": "user", "content": combined}],
-        max_tokens=1024, timeout=60, label="视频总结"
+        max_tokens=max_tokens, timeout=60, label="视频总结"
     )
     if summary:
         return summary
@@ -2135,7 +2184,7 @@ def process_video(bv: str, notify_callback=None):
             audio_ok = f_audio.result()
         print(f"  获得 {len(all_frames)} 帧 | 音频提取{'成功' if audio_ok else '失败'}")
 
-        # ============ 本地串行流水线 (v5.12.0): 意图先行, 总结才跑 ASR→视觉→文本; 聊天复用缓存 ============
+        # ============ 本地串行流水线 (v5.13.0): 意图先行, 总结才跑 ASR→视觉→文本; 聊天复用缓存; 总结长度随时长调整 ============
         # 不做量化: 每个阶段只加载一个模型, 用完释放显存再加载下一阶段
         if LOCAL_PIPELINE_ENABLED:
             import local_pipeline
@@ -2196,7 +2245,8 @@ def process_video(bv: str, notify_callback=None):
             print(f"  本地流水线 阶段3/3: 文本总结...", flush=True)
             try:
                 summary, ad_prefix = local_pipeline.text_stage(
-                    visual_desc, asr_text, ad_segments, notify_callback)
+                    visual_desc, asr_text, ad_segments, notify_callback,
+                    max_tokens=summary_max_tokens(duration))
             except Exception as exc:
                 print(f"  ⚠️ 本地文本总结失败: {exc}", flush=True)
                 summary, ad_prefix = "__MODEL_UNAVAILABLE__", ""
@@ -2261,7 +2311,8 @@ def process_video(bv: str, notify_callback=None):
         # 并行阶段3: LLM整合(第3次AI结果) 与 内嵌广告识别(复用阶段2产物) 同时进行
         print(f"  并行: GLM综合总结 + 内嵌广告识别(复用帧/ASR)...", flush=True)
         with ThreadPoolExecutor(max_workers=2) as ex:
-            f_summary = ex.submit(final_summarize, visual_desc, asr_text, ZHIPU_API_KEY)
+            f_summary = ex.submit(final_summarize, visual_desc, asr_text, ZHIPU_API_KEY,
+                              summary_max_tokens(duration))
             f_ad = ex.submit(detect_embedded_ads, bv, video_path, duration, notify_callback,
                              all_frames=all_frames, asr_chunks=asr_chunks)
             summary = f_summary.result()
@@ -2426,7 +2477,8 @@ def handle_chat_message(item: dict, bv: str, comment_type: int,
         # --- 回复总结 ---
         if video_summary_for_reply:
             # 只在总结回复前加广告空降提示；追问/chat保持原交互样式。
-            reply_text = f"{ad_prefix}{video_summary_for_reply}" if ad_prefix else video_summary_for_reply
+            reply_text = truncate_summary(
+                f"{ad_prefix}{video_summary_for_reply}" if ad_prefix else video_summary_for_reply)
         else:
             reply_text = "已经帮您总结过了,你可以在之前的评论中查看。"
             print(f"  ⚠️ 视频总结为空,回复提示")
@@ -2772,7 +2824,7 @@ def fetch_reply_messages() -> list:
 
 def main():
     print("=" * 60, flush=True)
-    print(f" B站@消息监控已启动 (v5.12.0: unread快速轮询 + 小时级列表兜底 + API退避 + 项目内持久化 + 内嵌广告识别 + 意图先行分流: 总结才识别, 聊天复用缓存)", flush=True)
+    print(f" B站@消息监控已启动 (v5.13.0: unread快速轮询 + 小时级列表兜底 + API退避 + 项目内持久化 + 内嵌广告识别 + 意图先行分流 + 总结长度随时长动态调整)", flush=True)
     print(f" 广告识别: {'开启' if AD_DETECTION_ENABLED else '关闭'} | 黑名单: {len(load_blacklist_keywords())}个关键词", flush=True)
     print(f" 轮询间隔: {POLL_INTERVAL}秒 | @列表兜底: {AT_FALLBACK_INTERVAL}秒 | 回复列表兜底: {REPLY_FALLBACK_INTERVAL}秒", flush=True)
     print(f" 工作目录: {WORK_DIR}", flush=True)

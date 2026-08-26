@@ -295,13 +295,16 @@ def local_generate(messages, system=None, max_tokens=250, temperature=None,
         return ""
 
 
-_LLM_SUMMARY_PROMPT = ("你是B站的一名观众,刚看完一个视频。请把视频内容总结成一段自然、连贯、口语化的中文文字。"
-"语气轻松自然,偶尔带点调侃,但不要过度娱乐化。把视频讲了什么、展示了什么、核心话题是什么说清楚,上限250字,说清楚就停。"
-"如果语音识别文本不准,主要靠画面判断。如果信息不足以判断视频真实内容,回复'信息不足,无法准确总结',不要编造。"
-"不要提及'识别''语音识别''画面分析'等技术过程。")
+def _make_summary_prompt(char_limit: int) -> str:
+    """构造本地文本总结提示词, 字数目标随时长动态调整(v5.13.0)。"""
+    return ("你是B站的一名观众,刚看完一个视频。请把视频内容总结成一段自然、连贯、口语化的中文文字。"
+            "语气轻松自然,偶尔带点调侃,但不要过度娱乐化。把视频讲了什么、展示了什么、核心话题是什么说清楚,"
+            f"根据视频长度,总结控制在{char_limit}字以内,说清楚就停。"
+            "如果语音识别文本不准,主要靠画面判断。如果信息不足以判断视频真实内容,回复'信息不足,无法准确总结',不要编造。"
+            "不要提及'识别''语音识别''画面分析'等技术过程。")
 
 
-def text_stage(visual_desc, asr_text, ad_segments=None, notify=None):
+def text_stage(visual_desc, asr_text, ad_segments=None, notify=None, max_tokens=None):
     """本地文本阶段: 使用常驻 Qwen3-8B, 生成总结 + 广告空降提示(模型常驻供后续对话回复复用)。
 
     Returns:
@@ -330,13 +333,15 @@ def text_stage(visual_desc, asr_text, ad_segments=None, notify=None):
             for s in ad_segments)
         combined += f"\n\n【广告检测提示】画面分析检测到疑似广告: {ad_desc}"
 
+    max_tokens = max_tokens or LLM_MAX_NEW_TOKENS
+    char_limit = max(50, min(1000, int(max_tokens * 0.85)))  # 与B站1000字评论上限对齐
     model, tok = _get_llm()
     try:
         style_note = ("\n\n请直接输出总结正文: 只输出一段连贯的中文文字, "
                       "严禁使用任何标题、序号、列表、加粗、斜体、Markdown符号、emoji、分隔线, "
                       "不要出现'画面分析''语音内容''总结'等小标题或标签。")
         msgs = [
-            {"role": "system", "content": _LLM_SUMMARY_PROMPT},
+            {"role": "system", "content": _make_summary_prompt(char_limit)},
             {"role": "user", "content": combined + style_note},
         ]
         text = tok.apply_chat_template(msgs, tokenize=False,
@@ -345,7 +350,7 @@ def text_stage(visual_desc, asr_text, ad_segments=None, notify=None):
         inputs = tok([text], return_tensors="pt").to("cuda")
         t0 = time.time()
         with torch.no_grad():
-            out = model.generate(**inputs, max_new_tokens=LLM_MAX_NEW_TOKENS,
+            out = model.generate(**inputs, max_new_tokens=max_tokens,
                                  do_sample=True, temperature=LLM_TEMPERATURE)
         dt = time.time() - t0
         ans = tok.decode(out[0][inputs["input_ids"].shape[1]:],
