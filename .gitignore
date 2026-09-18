@@ -29,3 +29,7 @@ _tmp/
 .docker-clean/
 .env
 .env.*
+
+# 部署补丁/一次性产物
+bili_monitor_gpu_release.patch
+bili_monitor.patched.py
