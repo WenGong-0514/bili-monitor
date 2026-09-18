@@ -14,6 +14,7 @@ asr:
   chunk_seconds: 30
   threads: 6
   device: auto
+  gpu_idle_release_sec: 1800   # 空闲30分钟后卸载模型并把显存还给驱动(<=0=只在任务后清缓存)
 text:
   model: glm-5.2
 detection:

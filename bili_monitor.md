@@ -3,7 +3,7 @@
 > ⚠️ **AI Generated Project** — 本项目全部代码由 AI 在人工提示词引导下生成，未经人工审核。使用本项目造成的任何损失与作者无关。完整免责声明见文档末尾。
 >
 > 最后更新: 2026-08-26
-> 版本: v5.13.1 (Docker 容器化部署 + RTX 2080 Ti 本地全流程: ASR→视觉→文本 + 本地对话回复/意图分类 + 意图先行分流 + 总结长度随时长调整 + 广告段合并/10s阈值/多段标记)
+> 版本: v5.13.2 (Docker 容器化部署 + RTX 2080 Ti 本地全流程: ASR→视觉→文本 + 本地对话回复/意图分类 + 意图先行分流 + 总结长度随时长调整 + 广告段合并/10s阈值/多段标记)
 > **测试平台迁移**: 2026-06-26 由原 mihomo/clashctl Linux 主机迁移至 Ubuntu 26.04 VM（systemd user service）；2026-08-21 迁移至 Windows Server + Docker Desktop 容器化部署；2026-08-25 加入 GPU ASR，后升级 RTX 2080 Ti 22GB 并启用本地全流程流水线（ASR→视觉→文本，不再依赖云端视觉/文本），详见下方「当前测试平台」。
 > **ASR 模式变更**: 2026-06-26 默认走本地 SenseVoiceSmall + FSMN-VAD (funasr) 推理；**2026-08-21 在线 ASR (qwen3-asr-flash / DashScope) 已全部过期下线**，本地 SenseVoiceSmall 为唯一 ASR 路径，2026-08-25 起支持 CUDA 加速与 CPU 自动回退，仅保留本地 faster-whisper 作为兜底。
 
@@ -73,6 +73,7 @@ WantedBy=default.target
 
 | 版本 | 日期 | 主要变更 |
 |------|------|----------|
+| v5.13.2 | 2026-09-18 | **GPU 显存空闲自动释放**: 新增 `gpu_release.py` 会话管理模块, ASR 模型改为懒加载; 每次转写结束立即 `empty_cache()` 归还本次显存; 空闲 `asr.gpu_idle_release_sec`(默认1800秒) 后卸载模型并把 CUDA 上下文一并还给驱动, 进程可继续复用 GPU。实测: 模型占用 1204MB → 空闲释放后仅剩 180MB 上下文基线; 同时修复长驻进程显存不回收问题(vmwp 侧曾累积 17GB 僵尸占用, 容器重建后降至 218MB)。注意 `cudaDeviceReset()` 与 torch 互斥(会致 `invalid device pointer` 崩溃), 模块已内置保护 |
 | v5.13.1 | 2026-08-26 | **广告检测修复: 合并+10s阈值+多段标记**: 视觉窗口按实际截帧时间戳合并相邻广告窗口(合并间隔=帧间隔, 随截帧策略自适应), 得到真实广告时长; 时长<10s 的粗略提及不再标记; 回复前广告提示改为逐段标记所有广告段(此前只提示第一段), 短提及不再误报、长广告不漏报 |
 | v5.13.0 | 2026-08-26 | **总结长度随时长动态调整**: 视频越短总结越精炼, 视频越长总结越详细。时长→token上限 分段线性映射(30s→100, 1min→150, 3min→260, 10min→500, 30min→1000, 1h→1500, 2h→2000封顶), 本地文本/云端降级均透传该上限, 提示词字数目标同步动态生成; 另加 B站1000字评论上限的句子边界截断保护 |
 | v5.12.0 | 2026-08-26 | **意图先行分流**: 意图分析最先用本地 LLM 判断(summary/chat/video_chat)，按意图走不同流水线。纯@/无明确意图视为总结请求时才触发 下载+ASR+视觉+文本；聊天/追问不再重复识别，直接复用缓存 ASR 转写+视觉描述+关键帧；已总结过的视频直接复用缓存总结。对话回复可引用缓存画面/语音原始内容 |
@@ -790,6 +791,62 @@ B站对评论有自动审核机制，回复发送成功(code=0)后仍可能被�
 - [x] 2026-06-19: **v5.5.2 同线程重复发送总结** — B站拦截/替换Bot回复内容后(如 state=18 删除),去重逻辑因内容相似度匹配失效导致子评论@触发时再次发送完整总结。修复: 改为基于Bot回复记录的线程级去重 — 只要在此线程回复过 + 视频已有缓存,就不再重复发总结,后续一律走聊天模式。
 
 ---
+
+## GPU 显存管理 (v5.13.2)
+
+### 设计原则
+
+**用 GPU，但用完必须还。** 本项目在 RTX 2080 Ti 22GB 上采用"懒加载 + 任务后归还 + 空闲整体释放"三级策略：
+
+| 时机 | 动作 | 效果（实测） |
+|------|------|--------------|
+| 首次需要识别语音 | 懒加载 SenseVoiceSmall 到 CUDA | 设备显存 17182 → 18386 MiB（+1204MB） |
+| 每次转写结束 | `torch.cuda.empty_cache()` | 18386 → 17362 MiB（归还全部推理缓存） |
+| 空闲超过 `gpu_idle_release_sec` | 卸载模型 + 释放 CUDA 上下文 | 仅剩 ~180MB 上下文基线，且**之后仍可复用 GPU** |
+
+### 模块与配置
+
+`gpu_release.py`（挂载进容器 `/app/gpu_release.py`，compose 已配置）提供 `GpuSession`：
+
+```python
+_gpu = GpuSession(loader=_load_sensevoice, idle_seconds=ASR_GPU_IDLE_RELEASE_SEC,
+                  allow_gpu=(ASR_LOCAL_DEVICE in ("auto", "cuda")), log=print)
+
+model = _gpu.acquire()      # 懒加载/复用
+...
+_gpu.after_task()           # 任务结束立即归还本次显存
+```
+
+`config.yaml`：
+
+```yaml
+asr:
+  device: auto                  # auto/cuda = 允许用 GPU；cpu = 完全不用 GPU
+  gpu_idle_release_sec: 1800    # 空闲30分钟释放；<=0 = 只在任务后清缓存
+```
+
+调参建议：视频连续处理时设大(1800~3600)避免反复重载模型（重载首载约13~17秒，命中缓存后约0.2秒）；偶尔处理一个、其余时间要腾卡时设小(60~300)。
+
+### 自检
+
+```bash
+docker exec bili-monitor sh -c "cd /app && /usr/local/bin/python -u gpu_release.py --selftest"
+```
+
+期望输出：加载 → 任务后清缓存 → 空闲释放 → 再次加载/释放都成功，且进程不崩溃。
+
+### 两个实测踩坑（重要）
+
+1. **`cudaDeviceReset()` 与 torch 互斥**：torch 已加载时调用它会销毁 CUDA 上下文，而 torch 分配器并不知情，之后任意 tensor 析构触发 `invalid device pointer` → 进程 SIGABRT。模块默认只在进程即将退出(`atexit`)时调用它。
+2. **WSL 下 `libcuda.so.1` 的真实路径**是 `/usr/lib/wsl/drivers/<驱动名>/libcuda.so.1.1`，`/usr/lib/wsl/lib/` 下并非都有；另 GeForce + WDDM 下 `nvidia-smi` 的进程级显存恒为 `[N/A]`，要看真实占用得用性能计数器 `\GPU Process Memory(*)\Local Usage`。
+
+### 显存占用参考
+
+| 场景 | 设备显存 |
+|------|----------|
+| 仅桌面合成 + 容器上下文（无 ASR 任务） | ~218 MiB |
+| ASR 模型已加载 | ~1.4 GB |
+| 空闲释放后残留（torch 上下文基线） | ~180 MiB |
 
 ## GitHub 上传指南
 

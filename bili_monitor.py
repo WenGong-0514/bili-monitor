@@ -122,6 +122,44 @@ ASR_LOCAL_MAX_SEG_MS = int(_ASR_CFG.get("local_max_seg_ms", 15000))
 ASR_LOCAL_THREADS = int(_ASR_CFG.get("local_threads", 8))
 ASR_LOCAL_DEVICE = str(_ASR_CFG.get("device", "auto")).lower()
 _SENSEVOICE_DEVICE = None  # 实际使用的推理设备(cpu/cuda), 模型加载后写入
+
+# --- GPU 会话: 懒加载 + 任务后清缓存 + 空闲自动释放显存 ---
+# gpu_idle_release_sec: 空闲多少秒后卸载模型并把显存还给驱动(<=0 表示只在任务后清缓存)
+ASR_GPU_IDLE_RELEASE_SEC = int(_ASR_CFG.get("gpu_idle_release_sec", 1800))
+try:
+    from gpu_release import GpuSession
+    _GPU_RELEASE_AVAILABLE = True
+except Exception as _e:  # noqa: BLE001  (未部署模块时自动退回旧行为)
+    print(f"    [GPU] gpu_release 模块不可用({_e.__class__.__name__}), 退回常驻显存模式", flush=True)
+    _GPU_RELEASE_AVAILABLE = False
+
+
+def _load_sensevoice(use_gpu: bool):
+    """真正建模型(由 GpuSession 在需要时调用)。"""
+    import torch
+    from funasr import AutoModel
+    torch.set_num_threads(ASR_LOCAL_THREADS)
+    try:
+        torch.set_num_interop_threads(2)
+    except RuntimeError:
+        pass  # 已设置过, 第二次调用会抛 RuntimeError
+    torch.set_float32_matmul_precision("high")
+    torch.backends.mkldnn.enabled = True
+    return AutoModel(
+        model=ASR_LOCAL_MODEL,
+        vad_model=ASR_LOCAL_VAD_MODEL,
+        vad_kwargs={"max_single_segment_time": ASR_LOCAL_MAX_SEG_MS},
+        disable_update=True,
+        device="cuda" if use_gpu else "cpu",
+        disable_pbar=True,
+    )
+
+
+_gpu = GpuSession(loader=_load_sensevoice,
+                  idle_seconds=ASR_GPU_IDLE_RELEASE_SEC,
+                  allow_gpu=(ASR_LOCAL_DEVICE in ("auto", "cuda")),
+                  log=print) if _GPU_RELEASE_AVAILABLE else None
+
 _SENSEVOICE_MODEL = None  # 懒加载, 首次调用 _do_local_transcribe_sensevoice 时初始化
 
 # --- 视觉模型降级链 ---
@@ -1622,37 +1660,22 @@ def _get_sensevoice_model():
     global _SENSEVOICE_MODEL
     if _SENSEVOICE_MODEL is not None:
         return _SENSEVOICE_MODEL
-    import torch
-    from funasr import AutoModel
-    torch.set_num_threads(ASR_LOCAL_THREADS)
-    try:
-        torch.set_num_interop_threads(2)
-    except RuntimeError:
-        pass  # 已设置过, 第二次调用会抛 RuntimeError
-    torch.set_float32_matmul_precision("high")
-    torch.backends.mkldnn.enabled = True
-    requested = ASR_LOCAL_DEVICE if ASR_LOCAL_DEVICE in ("auto", "cuda", "cpu") else "auto"
-    cuda_available = False
-    try:
-        cuda_available = torch.cuda.is_available()
-    except Exception as exc:
-        print(f"    [本地ASR] CUDA检测失败,使用CPU: {exc}", flush=True)
-    device = "cuda" if requested in ("auto", "cuda") and cuda_available else "cpu"
-    if requested == "cuda" and not cuda_available:
-        print("    [本地ASR] 配置请求cuda但CUDA不可用,自动回退CPU", flush=True)
     global _SENSEVOICE_DEVICE
-    _SENSEVOICE_DEVICE = device
-    print(f"    [本地ASR] 首次加载 {ASR_LOCAL_MODEL} (含 VAD {ASR_LOCAL_VAD_MODEL}, device={device})...", flush=True)
-    _SENSEVOICE_MODEL = AutoModel(
-        model=ASR_LOCAL_MODEL,
-        vad_model=ASR_LOCAL_VAD_MODEL,
-        vad_kwargs={"max_single_segment_time": ASR_LOCAL_MAX_SEG_MS},
-        disable_update=True,
-        device=device,
-        disable_pbar=True,
-    )
-    if device == "cuda":
+    if _gpu is None:
+        # 未部署 gpu_release 时退回原行为
+        use_gpu = ASR_LOCAL_DEVICE in ("auto", "cuda")
+        _SENSEVOICE_MODEL = _load_sensevoice(use_gpu)
+        _SENSEVOICE_DEVICE = "cuda" if use_gpu else "cpu"
+        return _SENSEVOICE_MODEL
+    # 由 GpuSession 判断能否用 GPU 并负责加载/释放
+    _SENSEVOICE_MODEL = _gpu.acquire()
+    _SENSEVOICE_DEVICE = _gpu.device
+    print(f"    [本地ASR] 模型就绪 {ASR_LOCAL_MODEL} (含 VAD {ASR_LOCAL_VAD_MODEL}, "
+          f"device={_SENSEVOICE_DEVICE}, 空闲 {ASR_GPU_IDLE_RELEASE_SEC}s 后自动释放显存)",
+          flush=True)
+    if _SENSEVOICE_DEVICE == "cuda":
         try:
+            import torch
             props = torch.cuda.get_device_properties(0)
             print(f"    [本地ASR] CUDA设备: {props.name} | {props.total_memory / 1024**3:.2f}GB", flush=True)
         except Exception:
@@ -1703,6 +1726,9 @@ def _do_local_transcribe_sensevoice(audio_path: str) -> tuple:
     except Exception as e:
         return (f"本地SenseVoice错误: {e}", "error")
     finally:
+        # 一次转写结束: 立刻归还本次占用的显存; 空闲超时后自动卸载模型
+        if _gpu is not None:
+            _gpu.after_task()
         if wav_path != audio_path and os.path.exists(wav_path):
             try:
                 os.remove(wav_path)
@@ -1737,13 +1763,18 @@ def _transcribe_chunks_batch(chunks: list) -> list:
     """一次批量调用SenseVoice识别所有分块, 按key对齐回填text, 返回原chunk列表。"""
     if not chunks:
         return chunks
-    res = _get_sensevoice_model().generate(
-        input=[c["path"] for c in chunks],
-        cache={},
-        language="auto",
-        use_itn=True,
-        batch_size_s=60,
-    )
+    try:
+        res = _get_sensevoice_model().generate(
+            input=[c["path"] for c in chunks],
+            cache={},
+            language="auto",
+            use_itn=True,
+            batch_size_s=60,
+        )
+    finally:
+        # 批量识别结束: 立刻归还本次占用的显存
+        if _gpu is not None:
+            _gpu.after_task()
     def _stem(p):
         return os.path.splitext(os.path.basename(str(p)))[0]
 

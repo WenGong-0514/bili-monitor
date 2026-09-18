@@ -5,6 +5,9 @@ services:
     container_name: bili-monitor
     restart: unless-stopped
     runtime: nvidia
+    cpus: 24
+    mem_limit: 12g
+    cpu_shares: 1024
     environment:
       - TZ=Asia/Shanghai
       - NVIDIA_VISIBLE_DEVICES=all
@@ -12,6 +15,8 @@ services:
     volumes:
       # 运行期持久化数据(状态/总结缓存/广告结果/工作目录)
       - ./data:/app/data
+      # GPU 会话管理模块(懒加载/任务后清缓存/空闲自动释放显存)
+      - ./gpu_release.py:/app/gpu_release.py:ro
       # 本地 ASR 模型缓存(modelscope), 避免每次重建后重新下载
       - modelscope_cache:/root/.cache/modelscope
       # 真实配置与黑名单以只读方式挂载, 不打包进镜像
